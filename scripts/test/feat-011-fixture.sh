@@ -10,10 +10,10 @@
 #   1. 合规 metric                        → exit 0 · stdout 含 "PASS"
 #   2. 普通未注册字段(status/url/value)  → exit 0(只 WARN class 2b · 整体仍 PASS)
 #   3. 保留身份漂移 endpoint_uuid          → exit 1 · stdout 含 "class 2a" + endpoint_uuid
-#   4. metric name 拼写错(未注册 metric) → exit 1 · stdout 含 "class 1" + 该 metric
+#   4. 未注册 metric(name 拼写错)         → exit 0(只 WARN class 1 · 整体仍 PASS)
 #   5. metric 缺 USR 三件套                → exit 1 · stdout 含 "class 3" + service
 #   6. 保留身份驼峰漂移 shardId            → exit 1 · stdout 含 "class 2a" + shardId
-#   7. 带注释 / 多行的 register 宏 typo    → exit 1 · stdout 含 "class 1" + 该 metric
+#   7. 带注释 / 多行的 register 宏 typo    → exit 0(只 WARN class 1 · 整体仍 PASS)
 #   8. registry YAML 格式错                → exit 1(不得静默 PASS)
 #
 # 用法:bash scripts/test/feat-011-fixture.sh
@@ -175,7 +175,9 @@ assert_case "用例3 保留身份漂移 endpoint_uuid CI fail" nonzero "$EXIT3a"
 rm -rf "$R3a"
 
 # ==========================================================================
-# 用例 4 · metric name 拼写错(foo_ttoal · 未注册 metric)→ FAIL class 1
+# 用例 4 · 未注册 metric(foo_ttoal · name 拼写错)→ 只 WARN class 1 · 整体 PASS
+#   Datadog 式治理:未注册 metric 是「未纳管」而非错误 · 放行不阻断。
+#   期望:exit 0 · stdout 含 "PASS" 且含 "class 1" + foo_ttoal(WARN 行)。
 # ==========================================================================
 R3="$(mktemp -d)"; scaffold "$R3"; write_good_registry "$R3"
 cat > "$R3/pageserver/src/metrics.rs" <<'RS'
@@ -187,7 +189,7 @@ pub static FOO: Lazy<IntCounter> = Lazy::new(|| {
 });
 RS
 OUT3="$(run_checker "$R3")" && EXIT3=0 || EXIT3=$?
-assert_case "用例4 未注册 metric(拼写错)CI fail" nonzero "$EXIT3" "$OUT3" "class 1" "foo_ttoal"
+assert_case "用例4 未注册 metric(拼写错)只 WARN 整体 PASS" 0 "$EXIT3" "$OUT3" "PASS" "class 1" "foo_ttoal"
 rm -rf "$R3"
 
 # ==========================================================================
@@ -271,8 +273,10 @@ assert_case "用例6b 豁免名 shard_index 不 FAIL(整体 PASS)" 0 "$EXIT5b" "
 rm -rf "$R5b"
 
 # ==========================================================================
-# 用例 7 · 带注释 / 多行的 register 宏 metric typo → FAIL class 1
-#   覆盖修复 1:宏调用与 metric 名之间夹行注释 / 多行空白也要抽到。
+# 用例 7 · 带注释 / 多行的 register 宏 metric typo → 只 WARN class 1 · 整体 PASS
+#   覆盖修复 1:宏调用与 metric 名之间夹行注释 / 多行空白也要抽到(抽取能力不变);
+#   抽到的未注册 metric 现按新语义只 WARN 不 fail。
+#   期望:exit 0 · stdout 含 "PASS" 且含 "class 1" + foo_ttoal(证明确实抽到了)。
 # ==========================================================================
 R6="$(mktemp -d)"; scaffold "$R6"; write_good_registry "$R6"
 cat > "$R6/pageserver/src/metrics.rs" <<'RS'
@@ -285,7 +289,7 @@ pub static FOO: Lazy<IntCounter> = Lazy::new(|| {
 });
 RS
 OUT6="$(run_checker "$R6")" && EXIT6=0 || EXIT6=$?
-assert_case "用例7 带注释多行 register typo CI fail" nonzero "$EXIT6" "$OUT6" "class 1" "foo_ttoal"
+assert_case "用例7 带注释多行 register typo 只 WARN 整体 PASS" 0 "$EXIT6" "$OUT6" "PASS" "class 1" "foo_ttoal"
 rm -rf "$R6"
 
 # ==========================================================================

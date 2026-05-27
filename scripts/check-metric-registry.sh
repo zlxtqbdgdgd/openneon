@@ -22,11 +22,17 @@
 #   │       一律 FAIL(基于「概念词根 + 非 _id 后缀」的模式正则 · 不是死名单)。
 #   └─ 普通字段(其余一切)
 #        → 放行 + WARN:不在 tracing_known_fields 白名单只记 WARN 提示 · 不阻断。
+#
+# metric 同理:neon 存量有几百个真实指标未登记进 registry · 这是「未纳管」而非
+# 错误。故未注册 metric(class 1)只记 WARN 放行 · 不再判 FAIL —— 与普通字段
+# (class 2b)同款「保留集之外自由发挥」。真正硬管(FAIL)的只有「保留身份标签
+# 漂移(2a)」「已注册指标缺 USR 三件套(3)」「audit 核心 attr 缺失(4)」
+# 以及 schema 自身不可解析 / 版本不兼容。
 # ────────────────────────────────────────────────────────────────────────────
 #
 # 把 4 组件源码(pageserver / safekeeper / compute_tools / proxy)实际 emit 的
 # metric / tracing field · diff metric-registry.yaml 的期望集:
-#   class 1 · 未注册 metric                   → FAIL(exit 1)
+#   class 1 · 未注册 metric                   → WARN(不 fail · 放行 + 提示)
 #   class 2a · USR 保留身份标签非规范写法漂移  → FAIL(exit 1 · 模式硬拦 · 见下)
 #   class 2b · 未注册的普通 tracing field      → WARN(不 fail · 放行 + 提示)
 #   class 3 · metric 缺 USR 三件套             → FAIL(exit 1)
@@ -123,14 +129,19 @@ rg --no-heading --no-line-number --no-filename -U -o -e "$RG_REGISTER" "${SRC_DI
   | tr -d '"' \
   | sort -u > "$WORKDIR/actual_metrics.txt" || true
 
-# class 1 · actual - expected = 未注册 metric
+# class 1 · actual - expected = 未注册 metric → WARN(放行 · 不阻断 CI)
+# Datadog 式治理:metric 同字段一样分两类。neon 存量有几百个真实指标
+# (pageserver_* / compute_ctl_* ...)未登记进 registry · 这是「未纳管」而非错误 ·
+# 与 class 2b 普通字段同款「保留集之外自由发挥」原则 · 故仅记 WARN · 绝不 fail。
+# (如需强制新指标必须注册 · 见 docs/METRIC-REGISTRY.md「后续可做 diff-only 硬拦」。)
 UNREGISTERED="$(comm -23 "$WORKDIR/actual_metrics.txt" "$WORKDIR/expected_metrics.txt" || true)"
 if [[ -n "$UNREGISTERED" ]]; then
-  echo "FAIL · class 1 · 发现未注册 metric(需同 PR 在 $REGISTRY 加 entry):"
+  echo "WARN · class 1 · 发现未注册 metric(放行 · 未纳入治理 · 不阻断 CI):"
   echo "$UNREGISTERED" | sed 's/^/    - /'
-  echo "    Hint: 加 metrics: 列表项 · 含 name / component / type / unit / required_tags_subset(必含 service,env,version)/ source_file"
+  echo "    Hint: 可选 · 想纳入治理可加进 $REGISTRY 的 metrics: 列表项"
+  echo "          (含 name / component / type / unit / required_tags_subset(必含 service,env,version)/ source_file)。"
+  echo "          对齐 Datadog 保留集之外自由 · 不强制。"
   echo ""
-  FAILED=1
 fi
 
 # warn · expected - actual = registry stale(源码已删但 registry 未跟进)

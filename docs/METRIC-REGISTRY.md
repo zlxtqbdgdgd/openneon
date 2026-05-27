@@ -12,7 +12,7 @@ safekeeper / compute / proxy)的 metric / tracing field / audit event schema,
 | `metric-registry.yaml`(repo root) | 单一事实表:metric name + 必填 tag schema + audit event attr |
 | `scripts/check-metric-registry.sh` | CI 检查脚本(ripgrep + yq + bash · 0 副作用) |
 | `.github/workflows/metric-registry-check.yml` | GitHub Actions PR gate(paths filter 限定触发) |
-| `scripts/test/feat-011-fixture.sh` | 9 用例独立验证 fixture(不需真 dev server · 覆盖 class 1/2a/2b/3 + 豁免名 + 坏 YAML) |
+| `scripts/test/feat-011-fixture.sh` | 9 用例独立验证 fixture(不需真 dev server · 覆盖 class 1 WARN/2a/2b/3 + 豁免名 + 坏 YAML) |
 
 ## 治理模型:Datadog 式「保留集硬管 + 其余放行」
 
@@ -24,16 +24,23 @@ safekeeper / compute / proxy)的 metric / tracing field / audit event schema,
   → **硬管(FAIL)**。这几个概念是跨组件 JOIN 的身份锚点,命名漂移会直接打断关联查询。
 - **普通字段**(`status` / `url` / `user` / `value` / `waiters` ... 十万行老库的几百个既有字段)
   → **放行 + WARN**。不在白名单只是「未登记」,不是错误。绝不因此把存量库判红。
+- **未注册 metric**(源码 emit 但不在 registry · `pageserver_*` / `compute_ctl_*` ... 几百个存量真实指标)
+  → **放行 + WARN**。同普通字段一样,这是「未纳管」而非错误。
 
 > 为什么这么改:旧版把「任何不在白名单的 tracing field」一律判 FAIL,等于要求先把
 > neon 几百个既有合法字段全部 seed 进白名单,否则整库 CI 长红——守门员把「USR 保留身份
 > 标签」和「普通日志字段」混为一谈。现在两者分开对待,硬拦只盯真正会造成跨组件漂移的保留身份。
+>
+> metric 也是同款毛病:neon 存量有几百个真实指标未登记进 registry,旧版把它们全判
+> class 1 FAIL → CI 长红。现按 Datadog「保留集之外自由发挥」原则,未注册 metric 降为
+> WARN 放行——只观测、不强制纳管。**如需强制新指标必须注册**,可后续做「diff-only 硬拦」
+> (只对本 PR 新增/改动的 metric 强制要求注册,存量不动),不在本期范围。
 
 ## 违规分类(FAIL vs WARN 边界)
 
 | 类别 | 触发 | 结果 |
 |---|---|---|
-| class 1 | 源码 emit 的 metric 不在 registry | CI **fail** |
+| class 1 | 源码 emit 的 metric 不在 registry | **warn**(放行 · 未纳管 · 不阻断) |
 | **class 2a** | **USR 保留身份标签的非规范写法漂移**(如 `endpoint_uuid` / `endpointId` / `tenant_uuid` / `tenantId` / `timeline_uuid` / `timelineId` / `shard_uuid` / `shardId` / `shardIndex`) | CI **fail** |
 | **class 2b** | 普通 tracing field 不在 `tracing_known_fields` 白名单(非保留身份) | **warn**(放行 · 不阻断) |
 | class 3 | registry 里某 metric 的 `required_tags_subset` 缺 USR 三件套(service/env/version) | CI **fail** |
@@ -57,14 +64,15 @@ safekeeper / compute / proxy)的 metric / tracing field / audit event schema,
 
 ## 开发者工作流(schema evolution)
 
-新加 **metric** 时**必须同 PR 改 registry**,否则 class 1 fail:
+新加 **metric** 时,**建议(非强制)同 PR 加 registry entry** 把它纳入治理。
+未注册不阻断 CI,只出 class 1 WARN 提示:
 
 ```
 改 pageserver/src/metrics.rs:
   + register_int_counter!("pageserver_layer_eviction_total", "...")
         ↓ 发 PR · CI 触发
-  FAIL · class 1 · 未注册 metric: pageserver_layer_eviction_total
-        ↓ 同 PR 加 metric-registry.yaml entry
+  WARN · class 1 · 未注册 metric: pageserver_layer_eviction_total(放行 · 不阻断)
+        ↓ (可选)同 PR 加 metric-registry.yaml entry 纳入治理
   - name: pageserver_layer_eviction_total
     component: pageserver
     type: counter
@@ -72,8 +80,11 @@ safekeeper / compute / proxy)的 metric / tracing field / audit event schema,
     required_tags_subset: [service, env, version, tenant_id, timeline_id]
     source_file: pageserver/src/metrics.rs
         ↓ push 同 PR · CI re-run
-  PASS · reviewer 在同份 diff 里看到「代码 + registry」1:1 对应
+  PASS(WARN 清掉)· reviewer 在同份 diff 里看到「代码 + registry」1:1 对应
 ```
+
+> 一旦 metric 被加进 registry 纳入治理,它的 `required_tags_subset` 就**必须含 USR 三件套**
+> (service/env/version),否则 class 3 FAIL——纳管即受约束。未纳管的存量 metric 不受此约束。
 
 **保留身份漂移**(`tenantId` 应为 `tenant_id` · `endpoint_uuid` 应为 `endpoint_id`)被 **class 2a**
 硬拦,**改源码字段名**而非加 registry。**普通新字段**(如 `cache_state`)不会阻断 CI——只出 class 2b
