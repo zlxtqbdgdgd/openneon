@@ -21,9 +21,13 @@
 use crate::id::{TenantId, TenantTimelineId, TimelineId};
 use crate::shard::{ShardIndex, TenantShardId};
 
-/// 紧急回滚 env flag：置 `true` 时 4 组件出口侧完全不注入 USR 标签，
+/// USR 贴标总开关 env flag：实际 env 变量名为 `USR_TAGGING_ENABLED`。
+/// 默认（未设）启用；显式设为 `false` / `0` 时 4 组件出口侧完全不注入 USR 标签，
 /// 退化到上游 baseline 形态（feat-008 §8 / feat-010 §8 回滚策略）。
-pub const USR_TAGGING_DISABLED_ENV: &str = "USR_TAGGING_ENABLED";
+///
+/// 常量名与其指向的 env 变量保持一致（均为 "ENABLED" 语义），
+/// 避免出现「名字暗示禁用、变量却叫 ENABLED」的运维误判。
+pub const USR_TAGGING_ENABLED_ENV: &str = "USR_TAGGING_ENABLED";
 
 /// feat-010 §8：置 `true` 时 4 组件退化到上游 legacy 字段命名（`endpoint` 等），
 /// 紧急 unblock 已部署用户 dashboard。
@@ -141,11 +145,11 @@ where
         .join(",")
 }
 
-/// 读取 [`USR_TAGGING_DISABLED_ENV`] / [`USR_NAMING_LEGACY_ENV`]，判断是否启用 USR 注入。
+/// 读取 [`USR_TAGGING_ENABLED_ENV`] / [`USR_NAMING_LEGACY_ENV`]，判断是否启用 USR 注入。
 ///
 /// fail-safe：env 未设时默认启用；显式设为 `false` / legacy 模式时禁用。
 pub fn usr_tagging_enabled() -> bool {
-    if let Ok(v) = std::env::var(USR_TAGGING_DISABLED_ENV) {
+    if let Ok(v) = std::env::var(USR_TAGGING_ENABLED_ENV) {
         if v.eq_ignore_ascii_case("false") || v == "0" {
             return false;
         }

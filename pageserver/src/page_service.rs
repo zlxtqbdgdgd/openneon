@@ -1200,6 +1200,12 @@ impl PageServerHandler {
                 // canonical `openneon.usr.*` namespace 注入本 GetPage span 的 OTel attribute，
                 // 让该 span 跨组件（compute/safekeeper/proxy）按 USR JOIN。短名字段（tenant_id 等）
                 // 已由上游 span 携带；这里补的是 namespace 化的 USR 出口。
+                //
+                // 注入路径只有这一条（手动 record_usr）：pageserver 进程**不注册** `UsrLayer`
+                // 自动注入 layer（grep 全仓确认无 `usr_layer()` wiring），所以本 span 不经过 layer，
+                // 不存在「layer 自动注入 + 手动注入」对同名 attribute 的双写重复。
+                // 这正是 `tracing_utils::usr` 文档里「该 span 不经过 layer 时保留手动注入」的例外情形。
+                // 若未来 pageserver 接入 `UsrLayer`，须删除本手动注入以避免重复写 `openneon.usr.*`。
                 span.in_scope(|| {
                     crate::usr::record_usr_on_span(&shard.tenant_shard_id, &timeline_id);
                 });

@@ -16,6 +16,7 @@
 //! 本模块只持有已 string 化的 [`UsrContext`]，避免 `tracing-utils` ↔ `utils` 依赖环。
 
 use std::sync::Arc;
+use std::sync::Once;
 
 use opentelemetry::KeyValue;
 use tracing::Subscriber;
@@ -142,13 +143,25 @@ where
         };
         let mut extensions = span.extensions_mut();
         // OpenTelemetryLayer 已在它自己的 on_new_span 里插入 OtelData；本 layer 排在其后，
-        // 把 USR attribute 追加到同一个 SpanBuilder。若 OtelData 不存在（未启用 OTel 出口）则跳过。
+        // 把 USR attribute 追加到同一个 SpanBuilder。
         if let Some(otel_data) = extensions.get_mut::<tracing_opentelemetry::OtelData>() {
             let kvs = usr.as_key_values();
             match otel_data.builder.attributes.as_mut() {
                 Some(existing) => existing.extend(kvs),
                 None => otel_data.builder.attributes = Some(kvs),
             }
+        } else {
+            // OtelData 缺失：通常是 layer 注册顺序错了（UsrLayer 排在 OpenTelemetryLayer 之前），
+            // 或没启用 OTel 出口。此时 USR attribute 会被静默丢弃 —— 这是隐蔽的数据质量问题，
+            // 必须给运行时可见性。用 Once 防止每个 span 都刷屏，只告警一次。
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "USR layer 未取到 OtelData，USR attribute 未注入；\
+                     请检查 layer 注册顺序（UsrLayer 必须排在 OpenTelemetryLayer 之后），\
+                     或确认 OTel 出口已启用。此告警只打印一次。"
+                );
+            });
         }
     }
 }
