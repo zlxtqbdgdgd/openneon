@@ -148,7 +148,7 @@ ssh openneon-dev '
   ./target/debug/neon_local tenant create --set-default
   ./target/debug/neon_local endpoint create main
   ./target/debug/neon_local endpoint start main
-  ./pg_install/v17/bin/psql -h 127.0.0.1 -p 55432 -U cloud_admin postgres -c "CREATE DATABASE neondb;"
+  psql -h 127.0.0.1 -p 55432 -U cloud_admin postgres -c "CREATE DATABASE neondb;"
   ./target/debug/neon_local endpoint list
 '
 ```
@@ -254,8 +254,8 @@ ssh openneon-dev '
   # 1. 所有服务都活着
   ./target/debug/neon_local endpoint list
 
-  # 2. PG 可连
-  ./pg_install/v17/bin/psql -h 127.0.0.1 -p 55432 -U cloud_admin neondb -c "SELECT version();"
+  # 2. PG 可连（neon-env.sh 把 pg_install/v17/bin 进 PATH · source 后 psql 直接可调）
+  psql -h 127.0.0.1 -p 55432 -U cloud_admin neondb -c "SELECT version();"
 
   # 3. mcp 可达（如部署在 3344）
   curl -sS -X POST -H "Content-Type: application/json" \
