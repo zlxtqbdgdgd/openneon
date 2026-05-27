@@ -34,9 +34,9 @@
 - 上游 `main` 定期 fetch 但不强制 rebase（详 design §3.1.3 时间线根因）
 - 本仓 default branch 跟随上游 / `feat/neon-autopilot` 是本项目工作分支
 
-### 本仓特定 caveat（TODO 待填）
+### 本仓特定 caveat · dev server 部署
 
-- [build 坑 / Rust crate 版本 / PG 编译选项等]
+详 [`docs/agents/test-infra.md`](docs/agents/test-infra.md) —— `epyc-256c.e8.luyouxia.net` 部署位置 + 编译入口 + 改码-pull-restart workflow + 8 条踩过的坑（含 BINDGEN / libseccomp / pg_crc32c_sse42 / hot-reload 禁忌等）。
 
 ## Agent skills
 
