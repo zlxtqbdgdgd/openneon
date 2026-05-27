@@ -666,6 +666,23 @@ async fn timeline_create_handler(
             .await
         {
             Ok(new_timeline) => {
+                // feat-031: timeline/branch 创建完成 → audit event (ddl_executed · §3.2 b)。
+                // neon 侧 branch 创建是 DDL/branch 操作的内核对应物;经 audit_event! 走
+                // target="openneon::audit" · OtelGuard 自动 export 到 OTLP collector ·
+                // 跟 mcp 侧 (openneon-mcp#110) openneon.audit.* schema 统一。
+                // op_class=CREATE_OR_RESTORE_BRANCH(feat-056 OpClass)· outcome=allow。
+                // USR hook(feat-008-011 L2b):tenant_id / timeline_id / shard_id 已可填 ·
+                // 其余 (endpoint_id) L2b propagate。
+                utils::audit_event!(
+                    event_type = utils::logging::audit_event_type::DDL_EXECUTED,
+                    op_class = "CREATE_OR_RESTORE_BRANCH",
+                    principal = "system:pageserver",
+                    outcome = "allow",
+                    "db.system" = "postgresql",
+                    "openneon.usr.tenant_id" = %tenant_shard_id.tenant_id,
+                    "openneon.usr.timeline_id" = %new_timeline_id,
+                    "openneon.usr.shard_id" = %tenant_shard_id.shard_slug(),
+                );
                 // Created. Construct a TimelineInfo for it.
                 let timeline_info = build_timeline_info_common(
                     &new_timeline,

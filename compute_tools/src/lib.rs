@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub mod audit_otel;
 pub mod checker;
 pub mod communicator_socket_client;
 pub mod config;
