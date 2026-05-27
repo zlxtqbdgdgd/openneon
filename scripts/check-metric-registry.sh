@@ -53,6 +53,18 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 FAILED=0   # 累计 hard violation · 全程不提前退出 · 一次报全所有问题
 
+# ---- 第 0 步:registry YAML 可解析性闸门 ----
+# 必须在任何 yq 读取之前显式校验:YAML 格式错时 yq 返回非 0 · set -e 下会让脚本
+# 在后续读取处直接 abort(且不打印明确原因)· 或在 process substitution 里被吞 →
+# CI 误报 PASS。这里先整体解析一遍并显式检查退出码 · 坏 YAML 立即报 FAIL 退出。
+if ! yq -e '.' "$REGISTRY" >/dev/null 2>"$WORKDIR/yq_parse.err"; then
+  echo "FAIL · registry 文件 YAML 解析失败(格式错?):$REGISTRY"
+  sed 's/^/    /' "$WORKDIR/yq_parse.err"
+  echo "----------------------------------------------------------------------"
+  echo "FAIL · metric-registry.yaml 无法解析 · 请修正 YAML 格式"
+  exit 1
+fi
+
 # ---- 第 0 步:registry schema 版本兼容 ----
 REG_VERSION="$(yq -r '.version' "$REGISTRY")"
 if [[ "$REG_VERSION" != "1" ]]; then
@@ -62,7 +74,8 @@ if [[ "$REG_VERSION" != "1" ]]; then
 fi
 
 # ---- 第 1 步:从 registry 抽 expected 集合 ----
-yq -r '.metrics[].name' "$REGISTRY" | grep -v '^null$' | sort -u > "$WORKDIR/expected_metrics.txt"
+# grep -v 在「全被过滤掉(空列表)」时返回非 0 · set -e 下会误中断 · 故加 || true。
+yq -r '.metrics[].name' "$REGISTRY" 2>/dev/null | { grep -v '^null$' || true; } | sort -u > "$WORKDIR/expected_metrics.txt"
 
 # 合法 tracing field = tracing_known_fields ∪ required_tags ∪ neon_specific_tags
 {
@@ -72,13 +85,19 @@ yq -r '.metrics[].name' "$REGISTRY" | grep -v '^null$' | sort -u > "$WORKDIR/exp
 } | sort -u > "$WORKDIR/known_fields.txt"
 
 # ---- 第 2 步:grep 源码实际 emit 的 metric name ----
-# register_* 宏后第一参数是 metric name(snake_case 字符串) · 调用常跨多行:
+# register_* 宏后第一参数是 metric name(snake_case 字符串) · 调用常跨多行 ·
+# 宏调用与 metric 名之间可能夹注释 / 多行空白:
 #     register_int_counter!(
+#         // 见 RFC-xxx
 #         "pageserver_xxx_total",
 #         "help text ..."
 #     )
-# 用 ripgrep multiline 模式:匹配 register 宏 · 非贪婪跨到第一个字符串字面量。
-RG_REGISTER='register_(int_|uint_|float_)?(counter|gauge|histogram)(_vec|_pair)?!\s*\(\s*\n?\s*"[a-z_][a-z0-9_]*"'
+# 用 ripgrep multiline 模式:匹配 register 宏 · 跨「任意空白 + 行注释(// ...)」
+# 直到第一个字符串字面量(metric name)。
+# [[:space:]] 含换行(-U multiline) · (//[^\n]*\n)* 吞掉宏调用与首参之间的整行注释。
+# 覆盖边界:不处理块注释 /* ... */ 夹在宏名与 metric 名之间的极端写法
+# (neon baseline 未见此形;若出现需再扩 pattern)。
+RG_REGISTER='register_(int_|uint_|float_)?(counter|gauge|histogram)(_vec|_pair)?!\s*\(\s*(//[^\n]*\n\s*)*"[a-z_][a-z0-9_]*"'
 
 rg --no-heading --no-line-number --no-filename -U -o -e "$RG_REGISTER" "${SRC_DIRS[@]}" 2>/dev/null \
   | grep -oE '"[a-z_][a-z0-9_]*"[^"]*$' \
@@ -109,16 +128,40 @@ fi
 
 # ---- 第 3 步:grep tracing / audit 宏里的结构化 field name ----
 # tracing::info!(field = value, ...) / info!(field, ...) / audit_event!(field = ...)
-# 抽出 `ident =` 形式的 field key(排除比较运算 ==)。
+# neon 大量用两种 field 写法 · 两种都要抽:
+#   (a) 显式键值     tracing::info!(tenant_id = %tid, "msg")
+#   (b) 简写(shorthand) tracing::info!(tenant_id, "msg")  —— 等价于 tenant_id = tenant_id
+# 简写形式若 typo(如 tenant_idd)同样要被 class 2 抓到 · 否则漏报。
 RG_TRACING='(tracing::)?(info|warn|error|debug|trace)!|audit_event!'
 
+# 先把每条匹配行抓到临时文件 · 再分别抽 (a)(b) 两种 field 形式。
 rg --no-heading --no-line-number --no-filename -e "$RG_TRACING" "${SRC_DIRS[@]}" 2>/dev/null \
-  | grep -oE '[a-z_][a-z0-9_]*[[:space:]]*=[^=]' \
-  | grep -oE '^[a-z_][a-z0-9_]*' \
-  | sort -u > "$WORKDIR/actual_fields_raw.txt" || true
+  > "$WORKDIR/tracing_lines.txt" || true
+
+{
+  # (a) 键值形式:`ident =`(排除比较运算 == · 故末尾 [^=])
+  grep -oE '[a-z_][a-z0-9_]*[[:space:]]*=[^=]' "$WORKDIR/tracing_lines.txt" \
+    | grep -oE '^[a-z_][a-z0-9_]*' || true
+
+  # (b) 简写形式:宏括号内逗号分隔的裸标识符(`tenant_id,` / `%tenant_id,`)。
+  #     处理顺序:① 先删掉所有双引号字符串字面量(消息文本 · 否则 "wal applied"
+  #     里的词会被当 field 误报)· ② 剥掉宏名及之前的前缀 · 只留「( 之后」·
+  #     ③ 按逗号切成单段(避免相邻简写 field 共享逗号被吞)· ④ 只留「整段就是一个
+  #     裸 snake_case 标识符(可带 ?/%/& sigil)」的段 —— 即简写 field;
+  #     `key = value` 段(含 =)/ 函数调用 a.b() / 路径 a::b 因整段不止一个 ident 被排除。
+  #     覆盖边界:此启发式按单行扫 · 跨多行展开的宏调用首行可能切不全 · 个别噪声
+  #     token 会先过下方关键字白名单兜底;真 typo 的简写 field 会落入 class 2。
+  sed -E 's/"([^"\\]|\\.)*"//g' "$WORKDIR/tracing_lines.txt" \
+    | sed -E 's/^.*(tracing::)?(info|warn|error|debug|trace)!|^.*audit_event!//' \
+    | tr ',' '\n' \
+    | grep -oE '^[[:space:]]*[(]?[[:space:]]*[?%&]?[a-z_][a-z0-9_]*[[:space:]]*[)]?[[:space:]]*$' \
+    | grep -oE '[a-z_][a-z0-9_]*' || true
+} | sort -u > "$WORKDIR/actual_fields_raw.txt"
 
 # 过滤掉明显的非-telemetry 噪声关键字(let/const 等不会出现在此 pattern · 保险起见去常见噪声)
-grep -vxE '(let|mut|const|if|else|for|while|match|return|self)' "$WORKDIR/actual_fields_raw.txt" \
+# 末尾追加常见 Rust 关键字 / 宏体噪声 token(true/false/Some/None/Ok/Err 等)。
+grep -vxE '(let|mut|const|if|else|for|while|match|return|self|true|false|Some|None|Ok|Err|as|fn|use|pub|ref|move|async|await|dyn|impl|where|crate|super|mod)' \
+  "$WORKDIR/actual_fields_raw.txt" \
   > "$WORKDIR/actual_fields.txt" || true
 
 # class 2 · actual fields - known = 未注册 field(typo gate)
@@ -133,18 +176,28 @@ if [[ -n "$UNKNOWN_FIELDS" ]]; then
 fi
 
 # ---- 第 4 步:每条 metric 必须含 USR 三件套(service / env / version)----
-while IFS=$'\t' read -r metric tags; do
-  [[ -z "$metric" || "$metric" == "null" ]] && continue
-  for usr in service env version; do
-    case ",$tags," in
-      *",$usr,"*) ;;
-      *)
-        echo "FAIL · class 3 · metric '$metric' 缺 USR 三件套字段 '$usr'(required_tags_subset 必含 service/env/version)"
-        FAILED=1
-        ;;
-    esac
-  done
-done < <(yq -r '.metrics[] | [.name, (.required_tags_subset // [] | join(","))] | @tsv' "$REGISTRY")
+# 注意:不能用 `while ... done < <(yq ...)` process substitution —— yq 解析失败
+# (YAML 格式错)时 · 子 shell 的非 0 退出码不会传播到 while · FAILED 仍 0 →
+# CI 在残缺 registry 上误报 PASS。改为先把 yq 输出落临时文件并显式校验 $? · 再喂 while。
+if ! yq -r '.metrics[] | [.name, (.required_tags_subset // [] | join(","))] | @tsv' "$REGISTRY" \
+     > "$WORKDIR/metrics_usr.txt" 2>"$WORKDIR/metrics_usr.err"; then
+  echo "FAIL · class 3 · yq 解析 $REGISTRY 的 metrics 失败(YAML 格式错?):"
+  sed 's/^/    /' "$WORKDIR/metrics_usr.err"
+  FAILED=1
+else
+  while IFS=$'\t' read -r metric tags; do
+    [[ -z "$metric" || "$metric" == "null" ]] && continue
+    for usr in service env version; do
+      case ",$tags," in
+        *",$usr,"*) ;;
+        *)
+          echo "FAIL · class 3 · metric '$metric' 缺 USR 三件套字段 '$usr'(required_tags_subset 必含 service/env/version)"
+          FAILED=1
+          ;;
+      esac
+    done
+  done < "$WORKDIR/metrics_usr.txt"
+fi
 
 # ---- 第 5 步:audit_events 联动一致性(feat-031 · cross-mcp 同源)----
 # neon 仓本地校验:每条 audit_event 的 required_attrs 必须含核心 attribute。

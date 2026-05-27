@@ -16,6 +16,7 @@ on:
       - 'libs/utils/**'          # feat-031 audit_event! macro 预期落地处
       - 'metric-registry.yaml'
       - 'scripts/check-metric-registry.sh'
+      - 'scripts/test/**'          # fixture 改动也触发 · 保证测试与 checker 同步演进
       - '.github/workflows/metric-registry-check.yml'
 
 # 同一 PR 连续 push 取消旧 run · 省 runner
