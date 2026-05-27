@@ -114,10 +114,32 @@ metrics:
     used_by_mcp_tool: [feat-020 T4 health_signals, feat-013 4LSN]
 
 # ============================================================================
+# 治理模型(对齐 Datadog Unified Service Tagging:保留集硬管 + 其余放行)
+# ============================================================================
+# tracing field 分两类对待 · CI(scripts/check-metric-registry.sh)据此判定:
+#
+#   ① 受治理的「USR 保留身份标签」概念词根:endpoint / tenant / timeline / shard / project
+#      → 硬管(FAIL)。规范形必须是 snake_case 的 <concept>_id。任何非 _id 后缀的写法
+#        都是命名漂移(class 2a · 基于【模式】而非死名单),例如:
+#          endpoint_uuid / endpointId / endpoint_uid   → 应为 endpoint_id
+#          tenant_uuid   / tenantId                     → 应为 tenant_id
+#          timeline_uuid / timelineId                   → 应为 timeline_id
+#          shard_uuid    / shardId / shardIndex         → 应为 shard_id
+#      → 豁免(不是漂移 · §11 OQ5):shard_index / shard_num(分片序号 · 非身份标识)。
+#
+#   ② 普通字段(其余一切,如 status / url / user / value / waiters ...)
+#      → 放行 + WARN(class 2b)。不在下方 tracing_known_fields 白名单只是「未登记」·
+#        不阻断 CI。想纳入治理可选择性追加到 tracing_known_fields(可选 · 不强制)。
+#        ——故本文件【不】去 seed 几百个存量普通字段;白名单只列想显式锁住命名的字段。
+#
+# 详见 docs/METRIC-REGISTRY.md「治理模型」与「class 2a 是模式判定,不是死名单」。
+# ============================================================================
+
+# ============================================================================
 # Tracing event field registry
 # (feat-031 audit 之外的普通 tracing::{info,warn,error,debug}! 结构化字段)
-# 不强制 enumerate 全部 event · 但用到的 field name 必须在本集 ∪ required_tags
-# ∪ neon_specific_tags · 否则 CI 判为「未注册 field」(疑似拼写错或新字段未声明)
+# 此处只列「想显式纳管 / 锁命名」的字段 · 不在此白名单的普通字段走 WARN 放行(见上治理模型)。
+# 用到的保留身份标签命名漂移由 class 2a 模式硬拦 · 不靠本白名单兜。
 # ============================================================================
 tracing_known_fields:
   # USR + Neon-specific tag 已在 required_tags / neon_specific_tags 声明 · 此处不重复

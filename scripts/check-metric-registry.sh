@@ -7,13 +7,31 @@
 # 在 openneon fork repo root 跑 · GitHub Actions workflow
 # .github/workflows/metric-registry-check.yml 调用 · 本地开发也可直接跑。
 #
+# ────────────────────────────────────────────────────────────────────────────
+# 治理模型:Datadog 式「少而严的保留集硬管 + 其余放行 + WARN」
+# (对齐 Datadog Unified Service Tagging:钦定 service/env/version 等少量
+#  保留标签强约束 · 其余自定义标签自由发挥不阻断)
+#
+# neon 是十万行老库 · 已有几百个既有合法 tracing 字段(status/url/user/value...)。
+# 若把「任何不在白名单里的字段」一律判 FAIL · 会把整个存量库判违规 → CI 长红 ·
+# 这是守门员把「USR 保留身份标签」和「几百个普通日志字段」混为一谈。
+#
+# 因此本脚本把字段分两类对待:
+#   ┌─ 受治理的「USR 保留身份标签」(endpoint/tenant/timeline/shard/project)
+#   │    → 硬管(FAIL):凡语义指这几个保留身份 · 却没用钦定的 `*_id` 规范形 ·
+#   │       一律 FAIL(基于「概念词根 + 非 _id 后缀」的模式正则 · 不是死名单)。
+#   └─ 普通字段(其余一切)
+#        → 放行 + WARN:不在 tracing_known_fields 白名单只记 WARN 提示 · 不阻断。
+# ────────────────────────────────────────────────────────────────────────────
+#
 # 把 4 组件源码(pageserver / safekeeper / compute_tools / proxy)实际 emit 的
 # metric / tracing field · diff metric-registry.yaml 的期望集:
-#   class 1 · 未注册 metric            → FAIL(exit 1)
-#   class 2 · 未注册 tracing field     → FAIL(exit 1 · typo gate)
-#   class 3 · metric 缺 USR 三件套     → FAIL(exit 1)
-#   warn    · registry stale(源码已删) → WARN(不 fail · 允许 rollback 灵活性)
-#   class 4(联动)· audit_events 缺核心 attr → FAIL(exit 1)
+#   class 1 · 未注册 metric                   → FAIL(exit 1)
+#   class 2a · USR 保留身份标签非规范写法漂移  → FAIL(exit 1 · 模式硬拦 · 见下)
+#   class 2b · 未注册的普通 tracing field      → WARN(不 fail · 放行 + 提示)
+#   class 3 · metric 缺 USR 三件套             → FAIL(exit 1)
+#   warn    · registry stale(源码已删)        → WARN(不 fail · 允许 rollback 灵活性)
+#   class 4(联动)· audit_events 缺核心 attr   → FAIL(exit 1)
 #
 # 退出码:0 = pass · 非 0 = 至少一类 hard violation。
 # 0 副作用:不改任何源文件 · 只读 + 临时目录。
@@ -131,7 +149,9 @@ fi
 # neon 大量用两种 field 写法 · 两种都要抽:
 #   (a) 显式键值     tracing::info!(tenant_id = %tid, "msg")
 #   (b) 简写(shorthand) tracing::info!(tenant_id, "msg")  —— 等价于 tenant_id = tenant_id
-# 简写形式若 typo(如 tenant_idd)同样要被 class 2 抓到 · 否则漏报。
+# 两种形式抽出的 field 都进同一个 actual_fields 集 · 再分别喂给:
+#   · class 2a(保留身份漂移硬拦 · 用保留大写的 mixedcase 集)
+#   · class 2b(普通未注册字段 WARN 放行)。
 RG_TRACING='(tracing::)?(info|warn|error|debug|trace)!|audit_event!'
 
 # 先把每条匹配行抓到临时文件 · 再分别抽 (a)(b) 两种 field 形式。
@@ -150,7 +170,7 @@ rg --no-heading --no-line-number --no-filename -e "$RG_TRACING" "${SRC_DIRS[@]}"
   #     裸 snake_case 标识符(可带 ?/%/& sigil)」的段 —— 即简写 field;
   #     `key = value` 段(含 =)/ 函数调用 a.b() / 路径 a::b 因整段不止一个 ident 被排除。
   #     覆盖边界:此启发式按单行扫 · 跨多行展开的宏调用首行可能切不全 · 个别噪声
-  #     token 会先过下方关键字白名单兜底;真 typo 的简写 field 会落入 class 2。
+  #     token 会先过下方关键字白名单兜底;简写 field 后续按保留身份(2a)/ 普通(2b)分流。
   sed -E 's/"([^"\\]|\\.)*"//g' "$WORKDIR/tracing_lines.txt" \
     | sed -E 's/^.*(tracing::)?(info|warn|error|debug|trace)!|^.*audit_event!//' \
     | tr ',' '\n' \
@@ -164,15 +184,105 @@ grep -vxE '(let|mut|const|if|else|for|while|match|return|self|true|false|Some|No
   "$WORKDIR/actual_fields_raw.txt" \
   > "$WORKDIR/actual_fields.txt" || true
 
-# class 2 · actual fields - known = 未注册 field(typo gate)
-UNKNOWN_FIELDS="$(comm -23 "$WORKDIR/actual_fields.txt" "$WORKDIR/known_fields.txt" || true)"
-if [[ -n "$UNKNOWN_FIELDS" ]]; then
-  echo "FAIL · class 2 · 发现未注册 tracing field(疑似拼写错或新字段未声明 schema):"
-  echo "$UNKNOWN_FIELDS" | sed 's/^/    - /'
-  echo "    Hint: 若是合法新字段 · 加到 $REGISTRY 的 tracing_known_fields"
-  echo "          若是拼写错(如 endpoint_uuid 应为 endpoint_id · tenantId 应为 tenant_id)· 改源码"
+# ──────────────────────────────────────────────────────────────────────────
+# 额外抽一遍「含大小写混合」的 field 标识符 —— 仅供 class 2a 保留身份漂移扫描用。
+# 上面 actual_fields 的抽取 pattern 是 [a-z_][a-z0-9_]* · 大写会被截断
+# (`endpointId` 只会抽到 `endpoint`)· 故驼峰漂移(endpointId/tenantId/shardIndex)
+# 在纯小写集里抓不到。这里对同样的 (a) 键值 + (b) 简写两种形式再抽一遍 ·
+# 但 pattern 放宽到 [A-Za-z_][A-Za-z0-9_]* 保留大小写 · 只喂给 2a 的正则比对 ·
+# 不进 class 2b 普通字段 WARN(避免引入大写噪声)。
+{
+  # (a) 键值形式(保留大小写)
+  grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[^=]' "$WORKDIR/tracing_lines.txt" \
+    | grep -oE '^[A-Za-z_][A-Za-z0-9_]*' || true
+  # (b) 简写形式(保留大小写)
+  sed -E 's/"([^"\\]|\\.)*"//g' "$WORKDIR/tracing_lines.txt" \
+    | sed -E 's/^.*(tracing::)?(info|warn|error|debug|trace)!|^.*audit_event!//' \
+    | tr ',' '\n' \
+    | grep -oE '^[[:space:]]*[(]?[[:space:]]*[?%&]?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[)]?[[:space:]]*$' \
+    | grep -oE '[A-Za-z_][A-Za-z0-9_]*' || true
+} | sort -u > "$WORKDIR/actual_fields_mixedcase.txt"
+
+# ──────────────────────────────────────────────────────────────────────────
+# class 2a · USR 保留身份标签「非规范写法」漂移 → FAIL(模式硬拦)
+#
+# 治理核心:endpoint / tenant / timeline / shard / project 这几个是 USR 钦定的
+# 保留身份概念 · 钦定的规范形是 `<concept>_id`(snake_case)。凡 telemetry 字段名
+# 里出现这些概念词根 · 却用了非 `_id` 的后缀(uuid / Id 驼峰 / uid / Index ...) ·
+# 即视为漂移 · 一律 FAIL。这是基于「概念词根 + 非 _id 后缀」的【模式】判定 ·
+# 不是逐个枚举的死名单 —— 任何新造的 endpoint_xxx 漂移变体都会被同一条正则拦下。
+#
+# 至少覆盖(大小写不敏感):
+#   endpoint_uuid / endpointId / endpoint_uid
+#   tenant_uuid   / tenantId
+#   timeline_uuid / timelineId
+#   shard_uuid    / shardId / shardIndex
+#
+# 豁免(不是漂移 · 按设计 §11 OQ5 放行):
+#   shard_index / shard_num  —— 是 neon 既有的合法 telemetry 字段(分片序号 ·
+#   非身份标识)· 钦定保留。注意:扫描范围沿用脚本「只扫 metric/tracing 宏出口」·
+#   故 neon 源码里普通的 `shard_index` / `ShardIndex` 局部变量本就不在 actual_fields
+#   里 · 不会被误伤;此处再对这两个名字显式白名单兜底。
+#
+# 正则解读(大小写不敏感 · 见下 grep -iE):
+#   ^(endpoint|tenant|timeline|shard|project)  概念词根
+#   _?                                          可选下划线(覆盖驼峰 endpointId)
+#   (uuid|uid|id|index|idx|num|guid|key)        非规范的身份后缀候选
+#   $                                           整词
+# 然后在命中集合里:
+#   · 把规范形 `<concept>_id`(全小写、恰好 _id 结尾)排除(那是合法的);
+#   · 把豁免名 shard_index / shard_num 排除。
+# 剩下的就是真漂移。
+# ──────────────────────────────────────────────────────────────────────────
+RESERVED_DRIFT_RE='^(endpoint|tenant|timeline|shard|project)_?(uuid|uid|id|index|idx|num|guid|key)$'
+RESERVED_CANONICAL_RE='^(endpoint|tenant|timeline|shard|project)_id$'
+
+# 命中保留概念词根 + 身份后缀 · 大小写不敏感
+# 用 mixedcase 抽取集(保留大写) · 才能抓到驼峰漂移 endpointId / shardIndex 等。
+grep -iE "$RESERVED_DRIFT_RE" "$WORKDIR/actual_fields_mixedcase.txt" 2>/dev/null \
+  | sort -u > "$WORKDIR/reserved_hits.txt" || true
+
+# 从命中里剔除:① 规范形 <concept>_id(全小写恰好 _id)· ② 豁免名 shard_index / shard_num
+RESERVED_DRIFT="$(
+  grep -vxiE "$RESERVED_CANONICAL_RE" "$WORKDIR/reserved_hits.txt" 2>/dev/null \
+    | grep -vxiE '^(shard_index|shard_num)$' 2>/dev/null || true
+)"
+if [[ -n "$RESERVED_DRIFT" ]]; then
+  echo "FAIL · class 2a · 发现 USR 保留身份标签的非规范写法(命名漂移 · 必须改源码):"
+  echo "$RESERVED_DRIFT" | sed 's/^/    - /'
+  echo "    Hint: endpoint/tenant/timeline/shard/project 是 USR 钦定保留身份 · 规范形必须是"
+  echo "          snake_case 的 <concept>_id(如 endpoint_uuid/endpointId/endpoint_uid → endpoint_id ·"
+  echo "          tenantId → tenant_id · shardId/shardIndex → shard_id)。改源码字段名而非加 registry。"
+  echo "          (分片序号请用既有 shard_index / shard_num · 已豁免)"
   echo ""
   FAILED=1
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
+# class 2b · 未注册的普通 tracing field → WARN(放行 · 不 fail)
+#
+# Datadog 式治理:保留集之外的字段「自由发挥」。十万行老库存量字段(status/url/
+# user/value/waiters...)不在 tracing_known_fields 白名单只是「未登记」· 不是错误 ·
+# 故仅记 WARN 提示开发者「想纳管可加白名单」· 绝不阻断 CI。
+# 注意:已在 class 2a 报过的保留身份漂移 · 此处剔除 · 不重复刷屏。
+# ──────────────────────────────────────────────────────────────────────────
+# comm 抽「actual - known」· 再用 grep -vxF -f 去掉 reserved_hits(已在 2a 报过的)。
+# reserved_hits.txt 为空文件时 · grep -f 无 pattern → 不删任何行(等价全放行)· 符合预期。
+comm -23 "$WORKDIR/actual_fields.txt" "$WORKDIR/known_fields.txt" 2>/dev/null \
+  > "$WORKDIR/unknown_raw.txt" || true
+if [[ -s "$WORKDIR/reserved_hits.txt" ]]; then
+  # 有保留命中 · 从普通未注册集里剔掉(已在 2a 报过)· 避免重复刷屏
+  UNKNOWN_FIELDS="$(grep -vxF -f "$WORKDIR/reserved_hits.txt" "$WORKDIR/unknown_raw.txt" 2>/dev/null || true)"
+else
+  # 无保留命中 · 普通未注册集原样(空 pattern 文件在部分 grep 实现下行为不一致 · 显式分支)
+  UNKNOWN_FIELDS="$(cat "$WORKDIR/unknown_raw.txt")"
+fi
+if [[ -n "$UNKNOWN_FIELDS" ]]; then
+  echo "WARN · class 2b · 发现未注册的普通 tracing field(放行 · 非保留身份标签 · 不阻断 CI):"
+  echo "$UNKNOWN_FIELDS" | sed 's/^/    - /'
+  echo "    Hint: 若想纳入治理 · 可加到 $REGISTRY 的 tracing_known_fields(可选 · 不强制)。"
+  echo "          普通字段对齐 Datadog「保留集之外自由发挥」· 仅提示不 fail。"
+  echo ""
 fi
 
 # ---- 第 4 步:每条 metric 必须含 USR 三件套(service / env / version)----
