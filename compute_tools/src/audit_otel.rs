@@ -130,13 +130,21 @@ fn emit_audit_record(line: &str, endpoint_id: &str, project_id: &str) {
     let sha = sha256_hex(line.as_bytes());
     audit_event!(
         event_type = audit_event_type::COMPUTE_AUDIT_LOG_RECORD,
+        // 必填四件套:op_class / principal 补齐(详 docs/audit-otel-schema.md「Required attributes」)。
+        // compute_audit_log_record 是 pgaudit 原始行 tail 转发,tail 时无法重建 OpClass
+        // → 给 UNCLASSIFIED(L3+ 解析 pgaudit 行 statement 类型再细分)。
+        op_class = "UNCLASSIFIED",
+        // 这条记录由 compute_ctl(service.name=neon-compute-ctl)代 PostgreSQL audit
+        // extension 出口,非人也非 agent → system:<component> 形式(design §3.2 a `system:odd-mrc` 同形)。
+        principal = "system:compute-ctl",
         outcome = "allow",
         "db.system" = "postgresql",
         "db.statement.sha256" = %sha,
         "openneon.audit.record_bytes" = line.len(),
-        // USR hook(L2a 仅 endpoint_id / project_id · 其余 L2b propagate)
+        // USR hook(L2a 仅 endpoint_id / project_id · 其余 L2b propagate)。
+        // project_id 跟 tenant/timeline/shard 同属 USR 身份字段 → openneon.usr.* namespace。
         "openneon.usr.endpoint_id" = %endpoint_id,
-        "openneon.audit.project_id" = %project_id,
+        "openneon.usr.project_id" = %project_id,
     );
 }
 
