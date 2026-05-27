@@ -540,9 +540,37 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
 
     let global_timelines = Arc::new(GlobalTimelines::new(conf.clone(), wal_backup.clone()));
 
+    // feat-009 USR: 构造 shard map cache（从 storage_controller pull tenant→shard 映射），
+    // 在出口侧给 per-timeline metric / tracing 补 shard_id。safekeeper 物理模型不动。
+    // hcc_base_url 缺省时 cache 禁用，shard_id 全部降级 "0000"。
+    let shard_map = safekeeper::shard_map_cache::ShardMapCache::new(conf.hcc_base_url.clone());
+    // 注册为进程全局实例，供深层 WAL acceptor tracing span 查询 shard_id。
+    shard_map.install_global();
+    {
+        // 30s interval 后台刷新（fire-and-forget；cache miss 不阻塞 WAL flush）。
+        let shard_map = shard_map.clone();
+        let gt = global_timelines.clone();
+        BACKGROUND_RUNTIME.handle().spawn(async move {
+            shard_map
+                .run_refresh_loop(
+                    safekeeper::shard_map_cache::DEFAULT_REFRESH_INTERVAL,
+                    move || {
+                        gt.get_all()
+                            .iter()
+                            .map(|t| t.ttid.tenant_id)
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect()
+                    },
+                )
+                .await;
+        });
+    }
+
     // Register metrics collector for active timelines. It's important to do this
     // after daemonizing, otherwise process collector will be upset.
-    let timeline_collector = safekeeper::metrics::TimelineCollector::new(global_timelines.clone());
+    let timeline_collector =
+        safekeeper::metrics::TimelineCollector::new(global_timelines.clone(), shard_map.clone());
     metrics::register_internal(Box::new(timeline_collector))?;
 
     // Keep handles to main tasks to die if any of them disappears.

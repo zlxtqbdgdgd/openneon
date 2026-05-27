@@ -545,10 +545,18 @@ impl WalAcceptor {
             };
 
             let span_ttid = wa.tli.ttid; // satisfy borrow checker
+            // feat-009 USR: 在 WAL acceptor（WAL receive / commit）span 出口侧补 shard_id。
+            // 取值来自全局 shard_map_cache（cache miss / USR 禁用降级 "0000"；多 shard 逗号分隔）。
+            // attribute key 跟 cornerstone 一致（openneon.usr.shard_id）。
+            let span_shard_id =
+                crate::shard_map_cache::shard_id_label_global(&span_ttid.tenant_id);
             wa.run()
-                .instrument(
-                    info_span!("WAL acceptor", cid = %conn_id.unwrap_or(0), ttid = %span_ttid),
-                )
+                .instrument(info_span!(
+                    "WAL acceptor",
+                    cid = %conn_id.unwrap_or(0),
+                    ttid = %span_ttid,
+                    "openneon.usr.shard_id" = %span_shard_id,
+                ))
                 .await
         })
     }
