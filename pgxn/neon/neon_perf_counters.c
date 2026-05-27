@@ -536,6 +536,25 @@ emit_one_histogram(ReturnSetInfo *rsinfo, metric_t *metrics, int *idx,
 	JsonbValue *jbv;
 	Jsonb	   *jb;
 	int			i = *idx;
+	int			nbuckets PG_USED_FOR_ASSERTS_ONLY = 0;
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * Invariant guard: this function relies on the fact that all *_bucket rows
+	 * belonging to one histogram are emitted as a SINGLE contiguous run by
+	 * io_histogram_to_metrics() / qt_histogram_to_metrics(). The walk below
+	 * stops at the first non-bucket metric; so if a gauge/counter were ever
+	 * inserted in the middle of a bucket run, the histogram would be silently
+	 * truncated (and a second, bogus histogram emitted for the tail). We assert
+	 * that the run we consume has exactly the curated width for this histogram:
+	 * query_time uses NUM_QT_BUCKETS, every other (IO) histogram uses
+	 * NUM_IO_WAIT_BUCKETS. If you add a histogram with a different bucket count,
+	 * extend this mapping.
+	 */
+	int			expected_buckets =
+		(strcmp(base_name, "query_time_seconds") == 0)
+		? NUM_QT_BUCKETS
+		: NUM_IO_WAIT_BUCKETS;
+#endif
 
 	pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
 
@@ -578,7 +597,15 @@ emit_one_histogram(ReturnSetInfo *rsinfo, metric_t *metrics, int *idx,
 
 		pushJsonbValue(&state, WJB_END_OBJECT, NULL);
 		i++;
+		nbuckets++;
 	}
+
+	/*
+	 * Protect the contiguity invariant (see comment above): a complete bucket
+	 * run must have exactly the curated number of buckets. A short run means a
+	 * non-bucket metric was interleaved and silently split the histogram.
+	 */
+	Assert(nbuckets == expected_buckets);
 
 	jbv = pushJsonbValue(&state, WJB_END_ARRAY, NULL);
 	jb = JsonbValueToJsonb(jbv);
