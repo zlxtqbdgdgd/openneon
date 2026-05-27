@@ -11,11 +11,14 @@
 //! - 复用 feat-008 cornerstone 的 `utils::usr` 做 shard_id string 化（`<index><count>` hex），不另起格式。
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use tracing::{info, warn};
 use utils::id::TenantId;
@@ -60,6 +63,9 @@ pub struct ShardMapCache {
     http: reqwest::Client,
     /// tenant_id → 该 tenant 当前 active 的 shard 列表（升序）。
     map: ArcSwap<HashMap<TenantId, Vec<ShardIndex>>>,
+    /// 已就 cache miss 告警过的 tenant 集合：read path 在热点上每个 miss 都打日志会刷屏，
+    /// 这里按 tenant 去重，每个缺失 tenant 只 WARN 一次（refresh 命中后会从集合移除，恢复可观测）。
+    warned_misses: Mutex<HashSet<TenantId>>,
 }
 
 impl ShardMapCache {
@@ -68,6 +74,7 @@ impl ShardMapCache {
             base_url,
             http: reqwest::Client::new(),
             map: ArcSwap::from_pointee(HashMap::new()),
+            warned_misses: Mutex::new(HashSet::new()),
         })
     }
 
@@ -89,7 +96,26 @@ impl ShardMapCache {
         }
         match self.get(tenant_id) {
             Some(shards) if !shards.is_empty() => usr::shard_ids_str(shards),
-            _ => usr::SHARD_ID_UNSHARDED.to_string(),
+            _ => {
+                // cache miss / 空列表：降级 "0000"，但这是数据质量问题（shard_id 失真），
+                // 不能静默。按 tenant 去重打一次 WARN，给运维可观测性。
+                self.warn_cache_miss_once(tenant_id);
+                usr::SHARD_ID_UNSHARDED.to_string()
+            }
+        }
+    }
+
+    /// 对某 tenant 的 cache miss 打一次性 WARN（按 tenant 去重，防热点路径刷屏）。
+    fn warn_cache_miss_once(&self, tenant_id: &TenantId) {
+        if let Ok(mut warned) = self.warned_misses.lock() {
+            if warned.insert(*tenant_id) {
+                warn!(
+                    %tenant_id,
+                    "shard map cache miss; shard_id 降级为 \"0000\"（unsharded）。\
+                     可能是 storage_controller 未配置 / pull 失败 / 该 tenant 尚未刷入缓存。\
+                     此 tenant 的告警只打印一次。"
+                );
+            }
         }
     }
 
@@ -104,8 +130,17 @@ impl ShardMapCache {
         let mut next: HashMap<TenantId, Vec<ShardIndex>> = HashMap::new();
         for tenant_id in tenant_ids {
             match self.fetch_one(base_url, tenant_id).await {
-                Ok(shards) => {
+                Ok(shards) if !shards.is_empty() => {
                     next.insert(*tenant_id, shards);
+                    // 成功刷入：清除该 tenant 的 miss 告警去重标记，
+                    // 若日后再 miss 可重新告警（恢复可观测）。
+                    if let Ok(mut warned) = self.warned_misses.lock() {
+                        warned.remove(tenant_id);
+                    }
+                }
+                Ok(_) => {
+                    // 拉到空列表：视同 miss，不写 cache，read path 会降级 "0000" 并告警。
+                    warn!(%tenant_id, "storage_controller returned empty shard list; falling back to unsharded");
                 }
                 Err(e) => {
                     // 单个 tenant 拉取失败不影响其它 tenant；该 tenant 走降级 "0000"。
@@ -121,7 +156,9 @@ impl ShardMapCache {
         base_url: &Url,
         tenant_id: &TenantId,
     ) -> anyhow::Result<Vec<ShardIndex>> {
-        let url = base_url.join(&format!("v1/tenant/{tenant_id}/shards"))?;
+        // 前导斜杠：base_url 无尾斜杠时 Url::join 会截掉最后一个路径段，
+        // 用 "/v1/..." 让 join 始终从 host 根拼接，避免路径丢失。
+        let url = base_url.join(&format!("/v1/tenant/{tenant_id}/shards"))?;
         let resp: TenantShardsResponse = self
             .http
             .get(url)
@@ -153,11 +190,19 @@ impl ShardMapCache {
         let _ = GLOBAL_SHARD_MAP.set(self.clone());
     }
 
-    /// 后台刷新任务：以 `interval` 周期调 [`Self::refresh`]。
+    /// 后台刷新任务：以 `interval` 周期调 [`Self::refresh`]，直到 `cancel` 被触发。
     ///
     /// `tenant_provider` 每次刷新前被调用，返回当前进程托管的 tenant 集合。
-    pub async fn run_refresh_loop<F>(self: Arc<Self>, interval: Duration, tenant_provider: F)
-    where
+    ///
+    /// 与 safekeeper 其它后台任务一致（如 `wal_backup_partial`），用
+    /// `tokio::select!` + [`CancellationToken::cancelled`] 在 SIGTERM 时优雅退出，
+    /// 不再 fire-and-forget。
+    pub async fn run_refresh_loop<F>(
+        self: Arc<Self>,
+        interval: Duration,
+        cancel: CancellationToken,
+        tenant_provider: F,
+    ) where
         F: Fn() -> Vec<TenantId> + Send + Sync + 'static,
     {
         if self.base_url.is_none() {
@@ -166,9 +211,16 @@ impl ShardMapCache {
         }
         let mut ticker = tokio::time::interval(interval);
         loop {
-            ticker.tick().await;
-            let tenant_ids = tenant_provider();
-            self.refresh(&tenant_ids).await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("shard map refresh loop cancelled; exiting");
+                    return;
+                }
+                _ = ticker.tick() => {
+                    let tenant_ids = tenant_provider();
+                    self.refresh(&tenant_ids).await;
+                }
+            }
         }
     }
 }

@@ -35,6 +35,7 @@ use storage_broker::{DEFAULT_ENDPOINT, Uri};
 use tokio::runtime::Handle;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use utils::auth::{JwtAuth, Scope, SwappableJwtAuth};
 use utils::id::NodeId;
@@ -546,14 +547,18 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
     let shard_map = safekeeper::shard_map_cache::ShardMapCache::new(conf.hcc_base_url.clone());
     // 注册为进程全局实例，供深层 WAL acceptor tracing span 查询 shard_id。
     shard_map.install_global();
+    // SIGTERM 时让 shard map 后台刷新优雅退出（与 safekeeper 其它后台任务一致，不 fire-and-forget）。
+    let shard_map_cancel = CancellationToken::new();
     {
-        // 30s interval 后台刷新（fire-and-forget；cache miss 不阻塞 WAL flush）。
+        // 30s interval 后台刷新（cache miss 不阻塞 WAL flush）。
         let shard_map = shard_map.clone();
         let gt = global_timelines.clone();
+        let cancel = shard_map_cancel.clone();
         BACKGROUND_RUNTIME.handle().spawn(async move {
             shard_map
                 .run_refresh_loop(
                     safekeeper::shard_map_cache::DEFAULT_REFRESH_INTERVAL,
+                    cancel,
                     move || {
                         gt.get_all()
                             .iter()
@@ -809,6 +814,9 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
         _ = sigterm_stream.recv() => info!("received SIGTERM, terminating")
 
     };
+    // 通知 shard map 刷新后台任务优雅退出。进程随后 exit(0)，
+    // 这里 cancel 主要给该 loop 一个干净的 break 点（与其它后台任务的取消语义一致）。
+    shard_map_cancel.cancel();
     std::process::exit(0);
 }
 
