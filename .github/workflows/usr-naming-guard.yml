@@ -8,7 +8,11 @@ on:
     paths:
       - 'compute_tools/src/**'
       - 'proxy/src/binary/**'
+      - 'pageserver/src/**'
+      - 'safekeeper/src/**'
       - 'libs/utils/src/logging.rs'
+      - 'libs/utils/src/usr.rs'
+      - 'libs/tracing-utils/src/usr.rs'
       - 'scripts/usr_naming_guard.sh'
       - '.github/workflows/usr-naming-guard.yml'
   push:

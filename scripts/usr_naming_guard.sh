@@ -14,10 +14,20 @@
 set -uo pipefail
 
 # 只扫 telemetry 出口侧代码；不扫 tests / vendored / FFI binding（feat-010 §11 OQ5）。
+#
+# scope 覆盖全部 4 组件的 telemetry 出口（feat-008 cornerstone + feat-009 safekeeper +
+# feat-010 compute/proxy）：pageserver / safekeeper 的 metric label + USR glue 也纳入扫描，
+# 防止 shard_id / tenant_id 等在这两个组件出口侧出现漂移命名。
+# PATTERNS 仅匹配 camelCase / `*_uuid` / `epId` 等不会出现在惯用 Rust 里的明确漂移形式，
+# 故按 src 目录粒度扫描误伤风险低；个别误伤用行内 `// USR-LINT-IGNORE` 豁免。
 SCOPE=(
   "compute_tools/src"
   "proxy/src/binary"
+  "pageserver/src"
+  "safekeeper/src"
   "libs/utils/src/logging.rs"
+  "libs/utils/src/usr.rs"
+  "libs/tracing-utils/src/usr.rs"
 )
 
 # 禁用的漂移命名（ERE）。canonical 形式见 feat-010 §4.1。
