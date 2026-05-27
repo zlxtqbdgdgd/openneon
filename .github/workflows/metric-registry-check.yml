@@ -1,0 +1,50 @@
+# feat-011 · Metric Registry CI 检查(USR 套 + feat-031 audit schema 验证层)
+#
+# 改 4 组件 metric/tracing 相关文件或 metric-registry.yaml 的 PR 触发本检查:
+# 强制「代码改动 + registry 改动」同 PR 出现 · reviewer side-by-side 看 diff。
+#
+# paths filter 收窄到 metric/tracing 相关路径 · 改 docs 等不触发(§11 OQ4)。
+name: metric-registry-check
+
+on:
+  pull_request:
+    paths:
+      - 'pageserver/**'
+      - 'safekeeper/**'
+      - 'compute_tools/**'
+      - 'proxy/**'
+      - 'libs/utils/**'          # feat-031 audit_event! macro 预期落地处
+      - 'metric-registry.yaml'
+      - 'scripts/check-metric-registry.sh'
+      - '.github/workflows/metric-registry-check.yml'
+
+# 同一 PR 连续 push 取消旧 run · 省 runner
+concurrency:
+  group: metric-registry-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install ripgrep + yq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          # yq v4(mikefarah)· 单二进制 · 锁版本避免 latest 漂移
+          YQ_VERSION=v4.44.3
+          sudo wget -qO /usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+          rg --version | head -1
+          yq --version
+
+      - name: run metric registry check
+        run: bash scripts/check-metric-registry.sh
