@@ -1196,6 +1196,14 @@ impl PageServerHandler {
                 // request handler log messages contain the request-specific fields.
                 let span = mkspan!(shard.tenant_shard_id.shard_slug());
 
+                // feat-008 USR cornerstone: 把 (tenant_id, timeline_id, shard_id) 三件套以
+                // canonical `openneon.usr.*` namespace 注入本 GetPage span 的 OTel attribute，
+                // 让该 span 跨组件（compute/safekeeper/proxy）按 USR JOIN。短名字段（tenant_id 等）
+                // 已由上游 span 携带；这里补的是 namespace 化的 USR 出口。
+                span.in_scope(|| {
+                    crate::usr::record_usr_on_span(&shard.tenant_shard_id, &timeline_id);
+                });
+
                 let timer = Self::record_op_start_and_throttle(
                     &shard,
                     metrics::SmgrQueryType::GetPageAtLsn,

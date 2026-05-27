@@ -30,6 +30,7 @@
 
 pub mod http;
 pub mod perf_span;
+pub mod usr;
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::WithExportConfig;

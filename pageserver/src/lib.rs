@@ -31,6 +31,8 @@ pub mod span;
 pub(crate) mod statvfs;
 pub mod task_mgr;
 pub mod tenant;
+/// USR (Unified Service Resource) attribute 注入 glue（feat-008 cornerstone 的 pageserver 侧）。
+pub mod usr;
 pub mod utilization;
 pub mod virtual_file;
 pub mod walingest;
