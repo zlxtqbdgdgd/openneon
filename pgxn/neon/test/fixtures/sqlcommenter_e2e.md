@@ -35,7 +35,7 @@ post_parse_analyze_hook 抽不到, 这行 backend 在 view 里**不出现**
 START_WAL_PUSH (proto_version '3', allow_timeline_creation 'true') /*traceparent='00-{proxy-generated-32hex}-{16hex}-01',tracestate='neon%3Droot%3Dproxy'*/
 ```
 
-**safekeeper 端解码**: `tracestate=neon=root=proxy` → "起点 = 内核, 不可信
+**safekeeper 端解码**: `tracestate=neon=proxy` → "起点 = 内核, 不可信
 回溯到业务 trace". RCA 报告显示 "Backend 段可信度: 仅内核".
 
 ---
@@ -55,7 +55,7 @@ SELECT pg_sleep(0.5) /*traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b71
 ```
  pid  | trace_id                          | span_id           | trace_flags | sampled | tracestate
 ------+-----------------------------------+-------------------+-------------+---------+--------------------
- 1234 | 0af7651916cd43dd8448eb211c80319c | b7ad6b7169203331 |           1 | t       | neon=root=app
+ 1234 | 0af7651916cd43dd8448eb211c80319c | b7ad6b7169203331 |           1 | t       | neon=app
 ```
 
 **walproposer → safekeeper** (path β 注入业务 trace_id):
@@ -64,7 +64,7 @@ START_WAL_PUSH (...) /*traceparent='00-0af7651916cd43dd8448eb211c80319c-...-01',
 ```
 
 **safekeeper 端解码**: trace_id 与 application OTel exporter 看到的同;
-`tracestate=neon=root=app` 表示 "起点 = 业务应用, RCA 可往业务 trace 回溯".
+`tracestate=neon=app` 表示 "起点 = 业务应用, RCA 可往业务 trace 回溯".
 
 **验收要点**: 同一个 32hex trace_id 同时出现在 (1) 应用 OTel SDK exporter
 (2) pg_stat_activity JOIN neon_stat_activity (3) safekeeper rust 端
@@ -177,4 +177,4 @@ case 8 (per-query 覆盖) 需要带 running postmaster, 留 integration test
 | client → DB SQLCommenter 抽取 | yes         | yes (path α) |
 | DB 内部跨进程 trace_id 转发   | **no** (无法改 Aurora/RDS 内核) | **yes** (path β walproposer → safekeeper) |
 | 暴露 backend trace state      | DBM agent 抓 wire-level | SQL view (`neon_stat_activity`) |
-| trace_id 起点信任度标识       | 无         | `tracestate=neon=root=app/proxy` |
+| trace_id 起点信任度标识       | 无         | `tracestate=neon=app/proxy` |

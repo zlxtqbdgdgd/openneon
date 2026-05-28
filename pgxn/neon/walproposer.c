@@ -663,7 +663,7 @@ HandleConnectionEvent(Safekeeper *sk)
  * client query that triggered the WAL flush, OR by proxy entry at the
  * very start of the connection), we URL-encode it as a SQLCommenter
  * `traceparent='...'` block and append it to `cmd`. The safekeeper /
- * pageserver then sees `tracestate='neon=root=proxy'` (or whatever the
+ * pageserver then sees `tracestate='neon=proxy'` (or whatever the
  * upstream set) so it can attribute its OpenTelemetry spans to the
  * same trace_id. This is the Neon-internal cross-process trace handoff
  * that Datadog DBM cannot do (they only see client→DB; they never get

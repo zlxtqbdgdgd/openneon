@@ -48,8 +48,8 @@ SELECT '/*literal_not_comment*/' AS query_literal;
 -- 不应触发 trace 提取
 SELECT count(*) AS expect_zero
 FROM neon_stat_activity
-WHERE pid = pg_backend_pid() AND tracestate = 'neon=root=app';
--- 注: 上一行可能会被它自己的 'neon=root=app' 命中 ⇒ 这正是预期边界 case;
+WHERE pid = pg_backend_pid() AND tracestate = 'neon=app';
+-- 注: 上一行可能会被它自己的 'neon=app' 命中 ⇒ 这正是预期边界 case;
 -- 注释里没 KV 但字符串内有像 KV 的, 应该 0 — 这正是 string-literal 隔离测试.
 
 -- ---- case 8: per-query 覆盖 (需要 feat-065 共栈, 本 PR 范围只测 lifecycle)
