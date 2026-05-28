@@ -1,0 +1,191 @@
+# metric-registry.yaml
+# ============================================================================
+# openneon fork 仓 root · metric / tracing field / audit event 的单一事实表
+# (single source of truth)
+#
+# 覆盖 4 组件:pageserver / safekeeper / compute(compute_ctl + compute_tools)/ proxy
+# 验证层 feat-011(USR 套 + feat-031 audit schema 的 CI gate)用本文件做基准:
+#   scripts/check-metric-registry.sh 把源码里实际 emit 的 metric / tracing field
+#   diff 本文件期望集 · 未注册 / 拼写错 / 缺 USR 三件套 → CI fail · stale → warn
+#
+# 维护约定(详 README §schema-evolution):
+#   开发者新加 metric / tracing field → 必须同 PR 在本文件加 entry · 否则 CI fail
+#   reviewer 在同一份 PR diff 里看到「代码改动 + registry 改动」1:1 对应
+#
+# 跨仓:audit_events 节跟 openneon-mcp 仓的 audit-registry.yaml 副本同源
+#       (feat-031 · 两仓各自 CI 检查自己仓内 audit emission · 不跨仓 fetch · §11 OQ3)
+# ============================================================================
+
+# registry schema 版本 · 改顶层结构(加 / 删 top-level key)需要 bump
+# CI script 兼容判定见 scripts/check-metric-registry.sh(当前接受 version 1)
+version: 1
+
+# ============================================================================
+# USR 三件套(Datadog Unified Service Tagging)
+# 必填 across 所有 metric · feat-008/009/010 在 4 组件注入
+# ============================================================================
+required_tags:
+  - name: service
+    type: enum
+    values:
+      - neon-pageserver
+      - neon-safekeeper
+      - neon-compute-ctl
+      - neon-proxy
+      - neon-storage-controller
+      - neon-storage-broker
+    source: feat-008/009/010
+    note: Datadog USR 第 1 件 · 跟 OTLP service.name 一致
+
+  - name: env
+    type: string
+    pattern: '^[a-z0-9-]+$'
+    source: feat-008/009/010
+    note: Datadog USR 第 2 件 · 跟 OTLP deployment.environment 一致
+
+  - name: version
+    type: string
+    pattern: '^[0-9a-f]{7,40}$'   # git short / full hash
+    source: feat-008/009/010
+    note: Datadog USR 第 3 件 · 跟 OTLP service.version 一致
+
+# ============================================================================
+# Neon-specific tag(18 字节 USR opaque key 拆分 · 跨组件 JOIN 用)
+# 每条标注允许出现在哪些组件(components) · CI 暂不强制 per-component 校验
+# (留待 OQ1 实测 emit 点后收紧 · 当前用于文档化命名锁)
+# ============================================================================
+neon_specific_tags:
+  - name: tenant_id
+    type: string
+    pattern: '^[0-9a-f]{32}$'
+    components: [pageserver, safekeeper, compute-ctl]   # proxy 阶段 tenant 未知 · 不要求
+    note: snake_case · 禁止 tenantId / tenant-id 等变体
+
+  - name: timeline_id
+    type: string
+    pattern: '^[0-9a-f]{32}$'
+    components: [pageserver, safekeeper]
+
+  - name: endpoint_id
+    type: string
+    pattern: '^ep-[a-z0-9-]+$'
+    components: [compute-ctl, proxy, pageserver]
+    note: feat-010 OQ · proxy 不许用 endpoint_uuid · 必须 endpoint_id
+
+  - name: shard_id
+    type: string
+    pattern: '^[0-9]{4}$|^unsharded$'
+    components: [pageserver, safekeeper]   # feat-009 补 safekeeper(之前漏标)
+    note: feat-009 主体
+
+# ============================================================================
+# Per-component metric registry
+# 每条 metric 的 name + 必填 tag 子集 + 类型 + 单位 + 出处文件
+#
+# 首版填「feat-008/009/010 4 组件 USR 字段最小集」(§11 OQ2):本节先列
+# 跨组件 JOIN 剧本(feat-020 T4 health_signals)用到的核心 metric · 现有
+# 全量 metric 通过 CI 的 STALE warn 增量发现后补全 · 不阻塞本 feature 上线。
+# ============================================================================
+metrics:
+  - name: pageserver_lfc_hits_total
+    component: pageserver
+    type: counter
+    unit: requests
+    required_tags_subset: [service, env, version, tenant_id, timeline_id]
+    optional_tags: [endpoint_id]
+    source_file: pageserver/src/metrics.rs
+    used_by_mcp_tool: [feat-020 T4 health_signals, feat-014 LFC view per-relation]
+
+  - name: pageserver_lfc_misses_total
+    component: pageserver
+    type: counter
+    unit: requests
+    required_tags_subset: [service, env, version, tenant_id, timeline_id]
+    optional_tags: [endpoint_id]
+    source_file: pageserver/src/metrics.rs
+    used_by_mcp_tool: [feat-020 T4 health_signals]
+
+  - name: safekeeper_wal_lag_bytes
+    component: safekeeper
+    type: gauge
+    unit: bytes
+    required_tags_subset: [service, env, version, tenant_id, timeline_id, shard_id]
+    source_file: safekeeper/src/metrics.rs
+    used_by_mcp_tool: [feat-020 T4 health_signals, feat-013 4LSN]
+
+# ============================================================================
+# 治理模型(对齐 Datadog Unified Service Tagging:保留集硬管 + 其余放行)
+# ============================================================================
+# tracing field 分两类对待 · CI(scripts/check-metric-registry.sh)据此判定:
+#
+#   ① 受治理的「USR 保留身份标签」概念词根:endpoint / tenant / timeline / shard / project
+#      → 硬管(FAIL)。规范形必须是 snake_case 的 <concept>_id。任何非 _id 后缀的写法
+#        都是命名漂移(class 2a · 基于【模式】而非死名单),例如:
+#          endpoint_uuid / endpointId / endpoint_uid   → 应为 endpoint_id
+#          tenant_uuid   / tenantId                     → 应为 tenant_id
+#          timeline_uuid / timelineId                   → 应为 timeline_id
+#          shard_uuid    / shardId / shardIndex         → 应为 shard_id
+#      → 豁免(不是漂移 · §11 OQ5):shard_index / shard_num(分片序号 · 非身份标识)。
+#
+#   ② 普通字段(其余一切,如 status / url / user / value / waiters ...)
+#      → 放行 + WARN(class 2b)。不在下方 tracing_known_fields 白名单只是「未登记」·
+#        不阻断 CI。想纳入治理可选择性追加到 tracing_known_fields(可选 · 不强制)。
+#        ——故本文件【不】去 seed 几百个存量普通字段;白名单只列想显式锁住命名的字段。
+#
+# 详见 docs/METRIC-REGISTRY.md「治理模型」与「class 2a 是模式判定,不是死名单」。
+# ============================================================================
+
+# ============================================================================
+# Tracing event field registry
+# (feat-031 audit 之外的普通 tracing::{info,warn,error,debug}! 结构化字段)
+# 此处只列「想显式纳管 / 锁命名」的字段 · 不在此白名单的普通字段走 WARN 放行(见上治理模型)。
+# 用到的保留身份标签命名漂移由 class 2a 模式硬拦 · 不靠本白名单兜。
+# ============================================================================
+tracing_known_fields:
+  # USR + Neon-specific tag 已在 required_tags / neon_specific_tags 声明 · 此处不重复
+  # 业务字段:
+  - lsn
+  - layer_path
+  - query_id
+  - error_code
+  - duration_ms
+
+# ============================================================================
+# Audit event registry(feat-031 §3.2 attribute schema 同源)
+# neon 仓侧只列 neon 4 组件 emit 的 audit event · mcp 侧 event(feat-026/027/029/060)
+# 定义在 openneon-mcp 仓的 audit-registry.yaml 副本 · 此处不列(§11 OQ3)
+#
+# 注:feat-031 尚未 ship · audit_event! macro 暂未落地 · 本节作为 schema 锁
+# 先行登记 · CI 仅校验「核心 attribute 必须存在于 required_attrs」· 不强制源码已 emit
+# (现阶段源码无 audit_event! 调用 · grep 抽不到 · 故不做 actual-vs-expected diff)
+# ============================================================================
+audit_events:
+  - event_type: ddl_executed
+    required_attrs:
+      - openneon.audit.event_type
+      - openneon.audit.op_class
+      - openneon.audit.principal
+      - openneon.audit.outcome
+      - db.system
+      - db.statement.sha256
+    optional_attrs:
+      - openneon.usr.tenant_id
+      - openneon.usr.timeline_id
+      - openneon.usr.endpoint_id
+      - openneon.usr.shard_id
+    component: pageserver
+    source_feature: feat-031 §3.2 (b)
+
+  - event_type: compute_audit_log_record
+    required_attrs:
+      - openneon.audit.event_type
+      - openneon.audit.outcome
+      - db.user
+      - db.system
+    optional_attrs:
+      - openneon.usr.tenant_id
+      - openneon.usr.timeline_id
+      - openneon.usr.endpoint_id
+      - openneon.usr.shard_id
+    component: compute-ctl
+    source_feature: feat-031 §3.2 (b)
