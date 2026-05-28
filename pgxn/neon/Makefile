@@ -18,10 +18,12 @@ OBJS = \
 	neon_lwlsncache.o \
 	neon_pgversioncompat.o \
 	neon_perf_counters.o \
+	neon_trace_status.o \
 	neon_utils.o \
 	neon_walreader.o \
 	pagestore_smgr.o \
 	relsize_cache.o \
+	sqlcommenter.o \
 	trace_context.o \
 	unstable_extensions.o \
 	walproposer.o \
@@ -53,6 +55,8 @@ DATA = \
 	neon--1.4--1.5.sql \
 	neon--1.5--1.6.sql \
 	neon--1.6--1.7.sql \
+	neon--1.7--1.8.sql \
+	neon--1.8--1.7.sql \
 	neon--1.7--1.6.sql \
 	neon--1.6--1.5.sql \
 	neon--1.5--1.4.sql \
@@ -64,7 +68,8 @@ PGFILEDESC = "neon - cloud storage for PostgreSQL"
 
 EXTRA_CLEAN = \
 	libwalproposer.a \
-	test/trace_context_test
+	test/trace_context_test \
+	test/sqlcommenter_test
 
 WALPROP_OBJS = \
 	$(WIN32RES) \
@@ -131,6 +136,24 @@ test/trace_context_test: trace_context.c trace_context.h test/test_trace_context
 .PHONY: check-trace-context
 check-trace-context: test/trace_context_test
 	./test/trace_context_test
+
+# ---------------------------------------------------------------------------
+# Standalone unit tests for sqlcommenter.{h,c} (feat-034/#37).
+#
+# Same independence rationale as check-trace-context: sqlcommenter.c is
+# linked from the backend extension AND walproposer, so we keep its tests
+# free of postgres.h / running-DB dependency. Run via:
+#     make -C pgxn/neon check-sqlcommenter
+# ---------------------------------------------------------------------------
+
+test/sqlcommenter_test: sqlcommenter.c sqlcommenter.h trace_context.c \
+		trace_context.h test/test_sqlcommenter.c
+	$(TRACE_CONTEXT_CC) $(TRACE_CONTEXT_CFLAGS) -I. \
+		trace_context.c sqlcommenter.c test/test_sqlcommenter.c -o $@
+
+.PHONY: check-sqlcommenter
+check-sqlcommenter: test/sqlcommenter_test
+	./test/sqlcommenter_test
 
 # ---------------------------------------------------------------------------
 # Standalone check target for the dynamic probe whitelist/denylist schema
