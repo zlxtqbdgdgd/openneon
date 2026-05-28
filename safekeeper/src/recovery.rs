@@ -24,6 +24,8 @@ use utils::postgres_client::{
     ConnectionConfigArgs, PostgresClientProtocol, wal_stream_connection_config,
 };
 
+use tracing_utils::trace_context::{NEON_ROOT_SAFEKEEPER_RECOVERY, TraceContext};
+
 use crate::SafeKeeperConf;
 use crate::receive_wal::{MSG_QUEUE_SIZE, REPLY_QUEUE_SIZE, WalAcceptor};
 use crate::safekeeper::{
@@ -399,9 +401,19 @@ async fn recovery_stream(
         }
     });
 
+    // feat-035 段 3 (SK → SK recovery): peer SK pull WAL 链路本地自生 trace_id
+    // (没有上游可承接 — 节点间 catch-up 是 SK 自驱). tracestate 打
+    // `neon=root=safekeeper-recovery` 让 trace UI 知道这段链路根来自哪里。
+    let trace_ctx = TraceContext::random_root();
+    let traceparent = trace_ctx.to_wire();
+    info!(
+        trace_id = %trace_ctx.trace_id_hex(),
+        span_id = %trace_ctx.span_id_hex(),
+        "starting SK→SK recovery stream with self-generated traceparent"
+    );
     let query = format!(
-        "START_REPLICATION PHYSICAL {} (term='{}')",
-        start_streaming_at, donor.term
+        "START_REPLICATION PHYSICAL {} (term='{}', traceparent '{}', tracestate '{}')",
+        start_streaming_at, donor.term, traceparent, NEON_ROOT_SAFEKEEPER_RECOVERY,
     );
 
     let copy_stream = client.copy_both_simple(&query).await?;

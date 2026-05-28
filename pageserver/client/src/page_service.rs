@@ -4,6 +4,7 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use pageserver_api::pagestream_api::{
     PagestreamBeMessage, PagestreamFeMessage, PagestreamGetPageRequest, PagestreamGetPageResponse,
+    PagestreamProtocolVersion,
 };
 use pageserver_api::reltag::RelTag;
 use tokio::task::JoinHandle;
@@ -54,9 +55,26 @@ impl Client {
         tenant_id: TenantId,
         timeline_id: TimelineId,
     ) -> anyhow::Result<PagestreamClient> {
+        // Default to V3 for backward compatibility with existing test tooling. Callers that
+        // want V4 (with W3C TraceContext) should use `pagestream_with_version` directly.
+        self.pagestream_with_version(tenant_id, timeline_id, PagestreamProtocolVersion::V3)
+            .await
+    }
+
+    pub async fn pagestream_with_version(
+        self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        protocol_version: PagestreamProtocolVersion,
+    ) -> anyhow::Result<PagestreamClient> {
+        let cmd_name = match protocol_version {
+            PagestreamProtocolVersion::V2 => "pagestream_v2",
+            PagestreamProtocolVersion::V3 => "pagestream_v3",
+            PagestreamProtocolVersion::V4 => "pagestream_v4",
+        };
         let copy_both: tokio_postgres::CopyBothDuplex<bytes::Bytes> = self
             .client
-            .copy_both_simple(&format!("pagestream_v3 {tenant_id} {timeline_id}"))
+            .copy_both_simple(&format!("{cmd_name} {tenant_id} {timeline_id}"))
             .await?;
         let (sink, stream) = copy_both.split(); // TODO: actually support splitting of the CopyBothDuplex so the lock inside this split adaptor goes away.
         let Client {
@@ -74,6 +92,7 @@ impl Client {
             sink: PagestreamSender {
                 shared: shared.clone(),
                 sink,
+                protocol_version,
             },
             stream: PagestreamReceiver {
                 shared: shared.clone(),
@@ -115,6 +134,9 @@ pub struct PagestreamSender {
     #[allow(dead_code)]
     shared: Arc<Mutex<PagestreamShared>>,
     sink: SplitSink<tokio_postgres::CopyBothDuplex<bytes::Bytes>, bytes::Bytes>,
+    /// Negotiated wire version (set by `Client::pagestream`). Required so we serialize each
+    /// outgoing message at exactly the version the server announced.
+    protocol_version: PagestreamProtocolVersion,
 }
 
 pub struct PagestreamReceiver {
@@ -211,7 +233,7 @@ impl PagestreamClient {
 impl PagestreamSender {
     // TODO: maybe make this impl Sink instead for better composability?
     pub async fn send(&mut self, msg: PagestreamFeMessage) -> anyhow::Result<()> {
-        let msg = msg.serialize();
+        let msg = msg.serialize(self.protocol_version);
         self.sink.send_all(&mut tokio_stream::once(Ok(msg))).await?;
         Ok(())
     }

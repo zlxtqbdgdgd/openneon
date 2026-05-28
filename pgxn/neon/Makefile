@@ -2,6 +2,9 @@
 
 
 MODULE_big = neon
+# 注: 本 OBJS 列表保持字母序。rebase 上游 neon 时, 若上游也在
+# relsize_cache.o ~ unstable_extensions.o 区间加新 .o, trace_context.o 这
+# 一行可能产生上下文冲突 — 解冲突时把它按字母序保留在 r 与 u 之间即可。
 OBJS = \
 	$(WIN32RES) \
 	communicator.o \
@@ -20,6 +23,7 @@ OBJS = \
 	neon_walreader.o \
 	pagestore_smgr.o \
 	relsize_cache.o \
+	trace_context.o \
 	unstable_extensions.o \
 	walproposer.o \
 	walproposer_pg.o \
@@ -60,7 +64,8 @@ DATA = \
 PGFILEDESC = "neon - cloud storage for PostgreSQL"
 
 EXTRA_CLEAN = \
-	libwalproposer.a
+	libwalproposer.a \
+	test/trace_context_test
 
 WALPROP_OBJS = \
 	$(WIN32RES) \
@@ -104,6 +109,29 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+# ---------------------------------------------------------------------------
+# Standalone unit tests for trace_context.{h,c}
+#
+# trace_context 是 W3C TraceContext (traceparent v00) 的 serializer/parser,
+# 零外部依赖 (不 #include postgres.h)。可以脱离 PGXS / pg_install 直接用
+# 系统 gcc 编出来跑单测。后续 feat-033 / 034 / 035 / 065 在 libpq /
+# libpagestore / proxy 各自 wire-up 时 #include "trace_context.h" 复用。
+#
+# 注: 本测试是独立 target, 不挂入 PGXS 的 check / installcheck 依赖链
+# (避免引入 running-DB 依赖)。CI / 开发机必须显式调:
+#     make -C pgxn/neon check-trace-context
+# ---------------------------------------------------------------------------
+
+TRACE_CONTEXT_CC ?= cc
+TRACE_CONTEXT_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -O0 -g
+
+test/trace_context_test: trace_context.c trace_context.h test/test_trace_context.c
+	$(TRACE_CONTEXT_CC) $(TRACE_CONTEXT_CFLAGS) -I. \
+		trace_context.c test/test_trace_context.c -o $@
+
+.PHONY: check-trace-context
+check-trace-context: test/trace_context_test
+	./test/trace_context_test
 
 # feat-036 · standalone jsonlog_ext unit test · don't depend on PGXS / vendor headers.
 # Anchor pattern (B1 #49 sqlcommenter same): test hook+escape+mask parsing logic

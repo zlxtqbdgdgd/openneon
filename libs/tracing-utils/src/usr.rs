@@ -32,11 +32,31 @@ pub const ATTR_TIMELINE_ID: &str = "openneon.usr.timeline_id";
 pub const ATTR_SHARD_ID: &str = "openneon.usr.shard_id";
 pub const ATTR_ENDPOINT_ID: &str = "openneon.usr.endpoint_id";
 pub const ATTR_PROJECT_ID: &str = "openneon.usr.project_id";
+/// feat-039/#2 USR pattern 第 8 维 metric label —— 仅 compute 侧 resolver 填充
+/// (OQ4: pageserver/safekeeper/proxy 共享进程不贴,避免误标其他 endpoint)。
+pub const ATTR_WARMING_UP: &str = "openneon.usr.warming_up";
+
+/// USR_LABEL_NAMES 常量列表 (feat-039/#2 USR pattern · 第 8 维加 warming_up)。
+///
+/// 跟 Prometheus + OTel + tracing 三 channel 自动同步: 各 channel exporter 都从这里
+/// 拿 label name 列表,一处改全链路飘起。
+pub const USR_LABEL_NAMES: &[&str] = &[
+    ATTR_TENANT_ID,
+    ATTR_TIMELINE_ID,
+    ATTR_SHARD_ID,
+    ATTR_ENDPOINT_ID,
+    ATTR_PROJECT_ID,
+    ATTR_WARMING_UP,
+];
 
 /// 一份已 string 化的 USR 上下文快照（resolver 输出）。
 ///
 /// 各字段都是 [`Option<String>`]：缺失字段不注入（fail-safe，OTel collector 端 backward compat）。
 /// `shard_id` 多 shard 场景填逗号分隔的升序列表（feat-009 §4.1）。
+///
+/// `warming_up`: feat-039/#2 第 8 维。仅 compute 侧 resolver 填充 `Some(true/false)`,
+/// 其它组件 (pageserver / safekeeper / proxy 共享进程) 保持 `None` 不贴 label,
+/// 避免误标其他 endpoint (OQ4)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UsrContext {
     pub tenant_id: Option<String>,
@@ -44,12 +64,16 @@ pub struct UsrContext {
     pub shard_id: Option<String>,
     pub endpoint_id: Option<String>,
     pub project_id: Option<String>,
+    /// feat-039/#2: 冷启 warming_up 子相位 flag。`Some(true)` 表示状态机尚未退出
+    /// (mcp baseline 算法应排除该 sample);`Some(false)` 表示已暖完;`None` 表示
+    /// 进程未启用 warming_up tracking (非 compute 组件)。
+    pub warming_up: Option<bool>,
 }
 
 impl UsrContext {
     /// 把上下文转成 OTel `KeyValue` 列表，仅含非空字段。
     pub fn as_key_values(&self) -> Vec<KeyValue> {
-        let mut out = Vec::with_capacity(5);
+        let mut out = Vec::with_capacity(6);
         if let Some(v) = &self.tenant_id {
             out.push(KeyValue::new(ATTR_TENANT_ID, v.clone()));
         }
@@ -65,6 +89,10 @@ impl UsrContext {
         if let Some(v) = &self.project_id {
             out.push(KeyValue::new(ATTR_PROJECT_ID, v.clone()));
         }
+        if let Some(v) = &self.warming_up {
+            // bool → "true" / "false" string,跟 Prometheus label 习惯一致 (label value 永远是 string)
+            out.push(KeyValue::new(ATTR_WARMING_UP, v.to_string()));
+        }
         out
     }
 
@@ -74,6 +102,7 @@ impl UsrContext {
             && self.shard_id.is_none()
             && self.endpoint_id.is_none()
             && self.project_id.is_none()
+            && self.warming_up.is_none()
     }
 }
 
@@ -174,4 +203,83 @@ where
     F: Fn() -> UsrContext + Send + Sync + 'static,
 {
     UsrLayer::new(Arc::new(resolver))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// feat-039/#2: USR_LABEL_NAMES 包含 warming_up 第 8 维。
+    #[test]
+    fn usr_label_names_contains_warming_up() {
+        assert!(USR_LABEL_NAMES.contains(&ATTR_WARMING_UP));
+        // 命名 canonical: openneon.usr.* 前缀。
+        for name in USR_LABEL_NAMES {
+            assert!(
+                name.starts_with("openneon.usr."),
+                "label `{name}` 不符合 canonical 命名"
+            );
+        }
+    }
+
+    /// feat-039/#2: warming_up 字段不为 None 时正确序列化为 "true"/"false" string。
+    #[test]
+    fn usr_context_serializes_warming_up_as_string() {
+        let ctx_warming = UsrContext {
+            warming_up: Some(true),
+            ..Default::default()
+        };
+        let kvs = ctx_warming.as_key_values();
+        let warm_kv = kvs
+            .iter()
+            .find(|kv| kv.key.as_str() == ATTR_WARMING_UP)
+            .expect("warming_up KV 必须出现");
+        assert_eq!(warm_kv.value.as_str(), "true");
+
+        let ctx_warm = UsrContext {
+            warming_up: Some(false),
+            ..Default::default()
+        };
+        let kvs = ctx_warm.as_key_values();
+        let warm_kv = kvs
+            .iter()
+            .find(|kv| kv.key.as_str() == ATTR_WARMING_UP)
+            .expect("warming_up=false KV 必须出现");
+        assert_eq!(warm_kv.value.as_str(), "false");
+    }
+
+    /// feat-039/#2 OQ4: warming_up=None 时不注入 label (pageserver/safekeeper/proxy 走这条)。
+    #[test]
+    fn usr_context_omits_warming_up_when_none() {
+        let ctx = UsrContext {
+            tenant_id: Some("tenant_x".to_string()),
+            warming_up: None,
+            ..Default::default()
+        };
+        let kvs = ctx.as_key_values();
+        assert!(
+            !kvs.iter().any(|kv| kv.key.as_str() == ATTR_WARMING_UP),
+            "warming_up=None 时不应注入 label"
+        );
+        // tenant_id 应仍正常注入。
+        assert!(kvs.iter().any(|kv| kv.key.as_str() == ATTR_TENANT_ID));
+    }
+
+    /// feat-039/#2: warming_up=Some 单独存在时 is_empty=false。
+    #[test]
+    fn usr_context_warming_up_alone_not_empty() {
+        let ctx = UsrContext {
+            warming_up: Some(true),
+            ..Default::default()
+        };
+        assert!(!ctx.is_empty());
+    }
+
+    /// 5 维全部 None 时 is_empty=true (无 warming_up tag)。
+    #[test]
+    fn usr_context_default_is_empty() {
+        let ctx = UsrContext::default();
+        assert!(ctx.is_empty());
+        assert!(ctx.as_key_values().is_empty());
+    }
 }

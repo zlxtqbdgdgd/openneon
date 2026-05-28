@@ -92,6 +92,29 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut auth_info = compute::AuthInfo::with_auth_keys(creds.keys);
     auth_info.set_startup_params(params, params_compat);
 
+    // feat-065/#29: proxy → compute 注入 traceparent GUC。
+    // 用 startup options 槽位 (-c neon.traceparent=...) 绕开 wire protocol bump，
+    // 兼容 feat-033 C 侧 PgBackendStatus.trace_context schema。
+    if let Some(mut tc) = ctx.trace_context() {
+        // child span_id 由 proxy 生成（#29 验收门）：本 connect_request span 当 parent，
+        // 让 compute 那头看到的是 proxy 这跳新 span_id（不复用上游 app 的）。
+        // 注意：path β 时 tc.span_context 已是 proxy 自分配，path α 时还是 upstream，
+        // 但 connect_request span 是它的 child —— 这里我们传出 connect_request span
+        // 自己的 span_id，所以下面用 from_current_span 重读一次。
+        if let Some(child) = crate::trace_context::from_current_span() {
+            // 起源保持原判定（α/β），只把 span_id 换成 proxy 这一跳的。
+            let new_sc = opentelemetry::trace::SpanContext::new(
+                tc.span_context.trace_id(),
+                child.span_context.span_id(),
+                tc.span_context.trace_flags(),
+                false, // 注入下游时 is_remote=false（proxy 自己的 span）
+                tc.span_context.trace_state().clone(),
+            );
+            tc.span_context = new_sc;
+        }
+        auth_info.inject_trace_context(&tc);
+    }
+
     let backend = auth::Backend::ControlPlane(cplane, creds.info);
 
     // TODO: callback to pglb
