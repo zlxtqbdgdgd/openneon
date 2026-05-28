@@ -38,6 +38,7 @@
 #include "utils/builtins.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
 
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
@@ -223,6 +224,28 @@ static uint64 lfc_generation;
 static FileCacheControl *lfc_ctl;
 static bool lfc_do_prewarm;
 
+/*
+ * feat-014: per-relation LFC stats.
+ *
+ * A shared hash table keyed by NRelFileInfo (relfilenode/db/tablespace),
+ * aggregating LFC hits/misses/evictions/resident-pages per relation. Guarded
+ * by the existing lfc_lock (no new lock). All update sites are already inside
+ * the LFC hot paths holding lfc_lock exclusively, so the per-rel update is an
+ * O(1) hash probe with no extra locking.
+ */
+typedef struct LfcRelStatsEntry
+{
+	NRelFileInfo key;			/* hash key: relfilenode + db + tablespace */
+	uint64		hits;
+	uint64		misses;
+	uint64		evictions;
+	int64		pages_in_cache; /* current resident pages of this rel in LFC */
+	TimestampTz last_access;	/* last hit or miss timestamp */
+} LfcRelStatsEntry;
+
+static HTAB *lfc_rel_hash;		/* shared, guarded by lfc_lock */
+static bool lfc_per_relation_stats; /* GUC neon.lfc_per_relation_stats */
+
 bool lfc_store_prefetch_result;
 bool lfc_prewarm_update_ws_estimation;
 
@@ -276,6 +299,22 @@ lfc_switch_off(void)
 		lfc_ctl->limit = 0;
 		dlist_init(&lfc_ctl->lru);
 		dlist_init(&lfc_ctl->holes);
+
+		/*
+		 * feat-014: the cache contents are gone, so no relation has resident
+		 * pages anymore. Zero pages_in_cache for every per-rel entry to keep it
+		 * consistent with used_pages (cumulative hits/misses/evictions are left
+		 * intact, mirroring the global counters which are not reset here).
+		 */
+		if (lfc_rel_hash != NULL)
+		{
+			HASH_SEQ_STATUS rel_status;
+			LfcRelStatsEntry *rel_entry;
+
+			hash_seq_init(&rel_status, lfc_rel_hash);
+			while ((rel_entry = hash_seq_search(&rel_status)) != NULL)
+				rel_entry->pages_in_cache = 0;
+		}
 
 		/*
 		 * We need to use unlink to to avoid races in LFC write, because it is not
@@ -368,6 +407,20 @@ LfcShmemInit(void)
 								 n_chunks + 1, n_chunks + 1,
 								 &info,
 								 HASH_ELEM | HASH_BLOBS);
+
+		/* feat-014: per-relation stats hash, guarded by the same lfc_lock. */
+		{
+			HASHCTL		relinfo;
+
+			memset(&relinfo, 0, sizeof(relinfo));
+			relinfo.keysize = sizeof(NRelFileInfo);
+			relinfo.entrysize = sizeof(LfcRelStatsEntry);
+			lfc_rel_hash = ShmemInitHash("lfc_rel_hash",
+										 n_chunks + 1, n_chunks + 1,
+										 &relinfo,
+										 HASH_ELEM | HASH_BLOBS);
+		}
+
 		memset(lfc_ctl, 0, sizeof(FileCacheControl));
 		dlist_init(&lfc_ctl->lru);
 		dlist_init(&lfc_ctl->holes);
@@ -395,12 +448,121 @@ LfcShmemInit(void)
 	}
 }
 
+/*
+ * feat-014: look up (or create) the per-relation stats entry for rinfo.
+ *
+ * MUST be called with lfc_lock held (exclusive). Returns NULL when per-relation
+ * stats are disabled, the hash is unavailable, or the entry could not be
+ * created (hash full -> fail-honest: we simply skip the per-rel accounting,
+ * the global counters are unaffected). O(1) hash probe, no new locking.
+ */
+static LfcRelStatsEntry *
+lfc_rel_stats_entry(NRelFileInfo rinfo, bool create)
+{
+	LfcRelStatsEntry *entry;
+	bool		found;
+
+	if (!lfc_per_relation_stats || lfc_rel_hash == NULL)
+		return NULL;
+
+	entry = hash_search(lfc_rel_hash, &rinfo,
+						create ? HASH_ENTER_NULL : HASH_FIND, &found);
+	if (entry == NULL)
+		return NULL;			/* not found, or hash full on HASH_ENTER_NULL */
+
+	if (create && !found)
+	{
+		entry->hits = 0;
+		entry->misses = 0;
+		entry->evictions = 0;
+		entry->pages_in_cache = 0;
+		entry->last_access = 0;
+	}
+	return entry;
+}
+
+/*
+ * feat-014: record LFC hits/misses for a relation (Get hot path).
+ * Called with lfc_lock held.
+ *
+ * access_time is the wall-clock timestamp captured by the caller BEFORE taking
+ * lfc_lock. We deliberately do NOT call GetCurrentTimestamp() here: this runs
+ * under the exclusive lfc_lock on the high-frequency getpage hot path, and
+ * GetCurrentTimestamp() bottoms out in a clock_gettime() syscall, so calling it
+ * inside the lock would lengthen hold time and worsen lock contention. The
+ * caller fetches the timestamp once outside the lock and passes it in.
+ */
+static void
+lfc_rel_stats_access(NRelFileInfo rinfo, uint64 hits, uint64 misses,
+					 TimestampTz access_time)
+{
+	LfcRelStatsEntry *entry;
+
+	if (hits == 0 && misses == 0)
+		return;
+
+	entry = lfc_rel_stats_entry(rinfo, true);
+	if (entry == NULL)
+		return;
+
+	entry->hits += hits;
+	entry->misses += misses;
+	entry->last_access = access_time;
+}
+
+/*
+ * feat-014: a page of this relation became resident in the LFC (Put hot path).
+ * Called with lfc_lock held.
+ */
+static void
+lfc_rel_stats_add_pages(NRelFileInfo rinfo, int64 npages)
+{
+	LfcRelStatsEntry *entry;
+
+	if (npages == 0)
+		return;
+
+	entry = lfc_rel_stats_entry(rinfo, true);
+	if (entry == NULL)
+		return;
+
+	entry->pages_in_cache += npages;
+}
+
+/*
+ * feat-014: pages of this relation were evicted from the LFC (Evict hot path).
+ * Called with lfc_lock held.
+ */
+static void
+lfc_rel_stats_evict(NRelFileInfo rinfo, int64 npages)
+{
+	LfcRelStatsEntry *entry;
+
+	if (npages == 0)
+		return;
+
+	entry = lfc_rel_stats_entry(rinfo, true);
+	if (entry == NULL)
+		return;
+
+	entry->evictions += npages;
+	entry->pages_in_cache -= npages;
+	if (entry->pages_in_cache < 0)
+		entry->pages_in_cache = 0;	/* defensive: never go negative */
+}
+
 void
 LfcShmemRequest(void)
 {
 	if (lfc_max_size > 0)
 	{
 		RequestAddinShmemSpace(sizeof(FileCacheControl) + hash_estimate_size(SIZE_MB_TO_CHUNKS(lfc_max_size) + 1, FILE_CACHE_ENRTY_SIZE));
+		/*
+		 * feat-014: per-relation stats hash. A relation occupies at least one
+		 * chunk, so the number of relations is bounded by the number of chunks;
+		 * size it the same way as the chunk hash (reusing lfc_lock, no new lock).
+		 */
+		RequestAddinShmemSpace(hash_estimate_size(SIZE_MB_TO_CHUNKS(lfc_max_size) + 1, sizeof(LfcRelStatsEntry)));
 		RequestNamedLWLockTranche("lfc_lock", 1);
 	}
 }
@@ -496,11 +658,18 @@ lfc_change_limit_hook(int newval, void *extra)
 			neon_log(LOG, "Failed to punch hole in file: %m");
 #endif
 		/* We remove the old entry, and re-enter a hole to the hash table */
-		for (int i = 0; i < lfc_blocks_per_chunk; i++)
 		{
-			bool is_page_cached = GET_STATE(victim, i) == AVAILABLE;
-			lfc_ctl->used_pages -= is_page_cached;
-			lfc_ctl->evicted_pages += is_page_cached;
+			int64	evicted_now = 0;	/* feat-014: pages of victim evicted */
+
+			for (int i = 0; i < lfc_blocks_per_chunk; i++)
+			{
+				bool is_page_cached = GET_STATE(victim, i) == AVAILABLE;
+				lfc_ctl->used_pages -= is_page_cached;
+				lfc_ctl->evicted_pages += is_page_cached;
+				evicted_now += is_page_cached;
+			}
+			/* feat-014: per-relation eviction accounting for the victim's rel */
+			lfc_rel_stats_evict(BufTagGetNRelFileInfo(victim->key), evicted_now);
 		}
 		hash_search_with_hash_value(lfc_hash, &victim->key, victim->hash, HASH_REMOVE, NULL);
 
@@ -536,6 +705,18 @@ lfc_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		neon_log(ERROR, "Neon module should be loaded via shared_preload_libraries");
 
+
+	/* feat-014: per-relation LFC stats feature flag. */
+	DefineCustomBoolVariable("neon.lfc_per_relation_stats",
+							"Track per-relation LFC hit/miss/eviction stats for neon_lfc_stats_per_relation",
+							"When off, the per-relation hash is not updated and the view returns no rows.",
+							&lfc_per_relation_stats,
+							true,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
 
 	DefineCustomBoolVariable("neon.store_prefetch_result_in_lfc",
 							"Immediately store received prefetch result in LFC",
@@ -1168,9 +1349,18 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 	uint32		entry_offset;
 	int			blocks_read = 0;
 	int			buf_offset = 0;
+	TimestampTz	access_time;
 
 	if (lfc_maybe_disabled())	/* fast exit if file cache is disabled */
 		return -1;
+
+	/*
+	 * feat-014: capture the per-relation last_access timestamp ONCE here,
+	 * outside lfc_lock. GetCurrentTimestamp() is a clock_gettime() syscall, so
+	 * we must not call it while holding the exclusive lfc_lock on this getpage
+	 * hot path; pass the pre-fetched value into lfc_rel_stats_access().
+	 */
+	access_time = GetCurrentTimestamp();
 
 	CopyNRelFileInfoToBufTag(tag, rinfo);
 	tag.forkNum = forkNum;
@@ -1267,6 +1457,8 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 			/* Pages are not cached */
 			lfc_ctl->misses += blocks_in_chunk;
 			pgBufferUsage.file_cache.misses += blocks_in_chunk;
+			/* feat-014: whole chunk missing -> per-relation miss accounting */
+			lfc_rel_stats_access(rinfo, 0, blocks_in_chunk, access_time);
 			LWLockRelease(lfc_lock);
 
 			buf_offset += blocks_in_chunk;
@@ -1360,6 +1552,8 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 			lfc_ctl->misses += iteration_misses;
 			pgBufferUsage.file_cache.hits += iteration_hits;
 			pgBufferUsage.file_cache.misses += iteration_misses;
+			/* feat-014: per-relation hit/miss accounting */
+			lfc_rel_stats_access(rinfo, iteration_hits, iteration_misses, access_time);
 
 			if (iteration_hits)
 			{
@@ -1460,13 +1654,17 @@ lfc_init_new_entry(FileCacheEntry* entry, uint32 hash)
 		/* Cache overflow: evict least recently used chunk */
 		FileCacheEntry *victim = dlist_container(FileCacheEntry, list_node,
 												 dlist_pop_head_node(&lfc_ctl->lru));
+		int64		evicted_now = 0;	/* feat-014: pages of victim evicted */
 
 		for (int i = 0; i < lfc_blocks_per_chunk; i++)
 		{
 			bool is_page_cached = GET_STATE(victim, i) == AVAILABLE;
 			lfc_ctl->used_pages -= is_page_cached;
 			lfc_ctl->evicted_pages += is_page_cached;
+			evicted_now += is_page_cached;
 		}
+		/* feat-014: per-relation eviction accounting for the victim's rel */
+		lfc_rel_stats_evict(BufTagGetNRelFileInfo(victim->key), evicted_now);
 
 		CriticalAssert(victim->access_count == 0);
 		entry->offset = victim->offset; /* grab victim's chunk */
@@ -1811,6 +2009,7 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 			if (lfc_ctl->generation == generation)
 			{
 				uint64	time_spent_us;
+				int64	added_now = 0;	/* feat-014: pages newly resident */
 				CriticalAssert(LFC_ENABLED());
 				/* Place entry to the head of LRU list */
 				CriticalAssert(entry->access_count > 0);
@@ -1837,9 +2036,12 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 					if (state != AVAILABLE)
 					{
 						lfc_ctl->used_pages += 1;
+						added_now += 1;
 						SET_STATE(entry, chunk_offs + i, AVAILABLE);
 					}
 				}
+				/* feat-014: per-relation resident page accounting (Put) */
+				lfc_rel_stats_add_pages(rinfo, added_now);
 			}
 			else
 			{
@@ -1979,6 +2181,78 @@ lfc_local_cache_pages(size_t *num_entries)
 	LWLockRelease(lfc_lock);
 
 	*num_entries = n_pages;
+	return result;
+}
+
+/*
+ * feat-014: snapshot the per-relation LFC stats.
+ *
+ * Returns a palloc'd array of LfcPerRelStatsRec (caller frees), one element per
+ * relation currently tracked in the per-rel hash. Returns NULL / 0 entries when
+ * per-relation stats are disabled or the LFC is not set up. Takes lfc_lock in
+ * shared mode for a consistent snapshot.
+ */
+LfcPerRelStatsRec *
+lfc_get_per_relation_stats(size_t *num_entries)
+{
+	HASH_SEQ_STATUS status;
+	LfcRelStatsEntry *entry;
+	LfcPerRelStatsRec *result;
+	size_t		n_rels;
+	size_t		n;
+
+	if (!lfc_ctl || !lfc_per_relation_stats || lfc_rel_hash == NULL)
+	{
+		*num_entries = 0;
+		return NULL;
+	}
+
+	LWLockAcquire(lfc_lock, LW_SHARED);
+	if (!LFC_ENABLED())
+	{
+		LWLockRelease(lfc_lock);
+		*num_entries = 0;
+		return NULL;
+	}
+
+	n_rels = hash_get_num_entries(lfc_rel_hash);
+	if (n_rels == 0)
+	{
+		LWLockRelease(lfc_lock);
+		*num_entries = 0;
+		return NULL;
+	}
+
+	result = (LfcPerRelStatsRec *)
+		MemoryContextAllocHuge(CurrentMemoryContext,
+							   sizeof(LfcPerRelStatsRec) * n_rels);
+
+	n = 0;
+	hash_seq_init(&status, lfc_rel_hash);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		/* Skip the (theoretical) hole/invalid key with relNumber 0. */
+		if (NInfoGetRelNumber(entry->key) == 0)
+			continue;
+		if (n >= n_rels)
+		{
+			/* Concurrent insert under shared lock shouldn't happen, but be safe. */
+			hash_seq_term(&status);
+			break;
+		}
+		result[n].relfilenode = NInfoGetRelNumber(entry->key);
+		result[n].reltablespace = NInfoGetSpcOid(entry->key);
+		result[n].reldatabase = NInfoGetDbOid(entry->key);
+		result[n].pages_in_cache = entry->pages_in_cache;
+		result[n].hits = entry->hits;
+		result[n].misses = entry->misses;
+		result[n].evictions = entry->evictions;
+		result[n].last_access = entry->last_access;
+		n++;
+	}
+	LWLockRelease(lfc_lock);
+
+	*num_entries = n;
 	return result;
 }
 
