@@ -229,6 +229,94 @@ pub fn init(
     Ok(())
 }
 
+/// feat-010 USR：发一条带 USR 命名规范的 tracing event。
+///
+/// 4 组件（pageserver / safekeeper / compute / proxy）的 telemetry event **统一走本 macro**，
+/// 而不是裸 `tracing::info!`，以保证字段命名落在 cornerstone canonical schema（`openneon.usr.*`
+/// / `endpoint_id` / `tenant_id` 等），避免命名漂移（feat-010 §3.2(a) / overview §10.2.3）。
+///
+/// 用法：`usr_event!("connection_accepted", endpoint_id = %ep, tenant_id = %tid);`
+///
+/// event 统一打到 `openneon::usr` target，便于 OTel collector / 日志侧按 target 过滤。
+#[macro_export]
+macro_rules! usr_event {
+    ($event_type:expr, $($field:tt)*) => {
+        ::tracing::info!(
+            target: "openneon::usr",
+            event_type = $event_type,
+            $($field)*
+        )
+    };
+    ($event_type:expr) => {
+        ::tracing::info!(
+            target: "openneon::usr",
+            event_type = $event_type,
+        )
+    };
+}
+
+/// 在 [`init`] 的基础上额外装配 feat-008 cornerstone 的 USR tracing layer（feat-010 §3.2(a)(b)）。
+///
+/// 4 个 binary（compute_ctl / proxy / local_proxy / pg_sni_router）的 bin 入口**统一调本函数**
+/// 取代裸 [`init`]，传入一个 `usr_resolver` closure（从 `ComputeSpec` / `ProxyConfig` /
+/// safekeeper shard_map_cache 取当前 USR 上下文快照），让所有 span 自动带上 `openneon.usr.*`
+/// attribute。`usr_resolver` 在每个新 span 上被调用（用 `Arc` snapshot 实现 < 100ns 取值）。
+///
+/// 注：[`tracing_utils::usr::UsrLayer`] 依赖 `tracing-opentelemetry` 的 OTel 层已注入
+/// `OtelData`，故本 layer 排在 fmt / error 层之后；若进程未启用 OTel 出口（无 `OtelData`），
+/// 该 layer 退化为 no-op，不影响 plain / json 日志。
+pub fn init_with_usr<F>(
+    log_format: LogFormat,
+    tracing_error_layer_enablement: TracingErrorLayerEnablement,
+    output: Output,
+    usr_resolver: F,
+) -> anyhow::Result<()>
+where
+    F: Fn() -> tracing_utils::usr::UsrContext + Send + Sync + 'static,
+{
+    let rust_log_env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+
+    use tracing_subscriber::prelude::*;
+    let r = tracing_subscriber::registry();
+    let r = r.with({
+        let log_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || -> Box<dyn std::io::Write> {
+                match output {
+                    Output::Stdout => Box::new(std::io::stdout()),
+                    Output::Stderr => Box::new(std::io::stderr()),
+                }
+            });
+        let log_layer = match log_format {
+            LogFormat::Json => log_layer.json().boxed(),
+            LogFormat::Plain => log_layer.boxed(),
+            LogFormat::Test => log_layer.with_test_writer().boxed(),
+        };
+        log_layer.with_filter(rust_log_env_filter())
+    });
+
+    let r = r.with(
+        TracingEventCountLayer(&TRACING_EVENT_COUNT_METRIC).with_filter(rust_log_env_filter()),
+    );
+
+    // feat-008 cornerstone：4 组件共用的 USR layer，把 resolver 解析出的三件套注入每个 span。
+    let usr_layer = tracing_utils::usr::usr_layer(usr_resolver);
+
+    match tracing_error_layer_enablement {
+        TracingErrorLayerEnablement::EnableWithRustLogFilter => r
+            .with(tracing_error::ErrorLayer::default().with_filter(rust_log_env_filter()))
+            .with(usr_layer)
+            .init(),
+        TracingErrorLayerEnablement::Disabled => r.with(usr_layer).init(),
+    }
+
+    Ok(())
+}
+
 /// Disable the default rust panic hook by using `set_hook`.
 ///
 /// For neon binaries, the assumption is that tracing is configured before with [`init`], after

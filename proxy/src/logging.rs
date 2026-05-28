@@ -69,11 +69,20 @@ pub fn init() -> anyhow::Result<LoggingGuard> {
         None
     };
 
+    // feat-010 USR 单入口：proxy 经 feat-008 cornerstone 的 UsrLayer 接入统一 USR 注入路径
+    // （AC #4 要求 4 binary 全走单入口）。proxy 的 USR（endpoint_id / project_id 等）是
+    // per-connection 的，不是进程级常量，故用默认（空）resolver 把 layer 作为 cornerstone
+    // 接入点装上：空 UsrContext 在 on_new_span 里早退为 no-op；per-conn 的 USR 字段仍由
+    // 各连接 span 字段 / usr_event! 按 canonical openneon.usr.* schema 注入。
+    // UsrLayer 依赖 OpenTelemetryLayer 已注入 OtelData，故排在 otlp_layer 之后。
+    let usr_layer = tracing_utils::usr::usr_layer(tracing_utils::usr::UsrContext::default);
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(otlp_layer)
         .with(json_log_layer)
         .with(text_log_layer)
+        .with(usr_layer)
         .try_init()?;
 
     Ok(LoggingGuard(provider))

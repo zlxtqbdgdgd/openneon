@@ -61,12 +61,21 @@ pub fn init_tracing_and_logging(
         tracing_utils::init_tracing("compute_ctl", tracing_utils::ExportConfig::default());
     let otlp_layer = provider.as_ref().map(tracing_utils::layer);
 
+    // feat-010 USR 单入口：compute_ctl 经 feat-008 cornerstone 的 UsrLayer 接入统一 USR
+    // 注入路径（AC #4 要求 4 binary 全走单入口）。compute 的 USR 三件套来自 per-request
+    // 的 ComputeSpec，不是进程级常量，故这里用一个默认（空）resolver 把 layer 作为
+    // cornerstone 接入点装上：空 UsrContext 在 on_new_span 里早退为 no-op，不影响日志；
+    // 具体 endpoint_id / tenant_id 等仍由各 span 字段 / usr_event! 按 canonical schema 注入。
+    // UsrLayer 依赖 OpenTelemetryLayer 已注入 OtelData，故必须排在 otlp_layer 之后。
+    let usr_layer = tracing_utils::usr::usr_layer(tracing_utils::usr::UsrContext::default);
+
     // Put it all together
     tracing_subscriber::registry()
         .with(env_filter)
         .with(otlp_layer)
         .with(fmt_layer)
         .with(json_to_file_layer)
+        .with(usr_layer)
         .init();
     tracing::info!("logging and tracing started");
 
