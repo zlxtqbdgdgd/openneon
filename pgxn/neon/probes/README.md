@@ -65,6 +65,14 @@ denylist:                        # 可选 · 任一 pattern 命中即拒绝 (覆
   - 复制:          `wal_sender` / `wal_receiver`
   - Neon Rust:    `pageserver` / `safekeeper` / `proxy`
   - 兜底:          `other` (在 `notes` 字段写实际子系统名,待 enum 扩)
+- **注解 (R2 元评 issue#54 comment 4564616746 补)**: subsystem enum 是分类标签,
+  不代表每个 subsystem 都对应 PG `probes.d` USDT probe。**`autovacuum` /
+  `bgwriter` / `wal_sender` / `wal_receiver` / `syscache` 在 PG 14+ 上游
+  `src/backend/utils/probes.d` 里没有 USDT probe**,要观测这几类后台进程
+  必须走 feat-069/A5 的 Rust `uprobe` (针对 Rust 改写部分) 或 PG C 函数 uprobe
+  (针对 PG 原生 C 部分)。usdt 段当前只列 `parser` / `rewriter` / `planner` /
+  `executor` / `lock` / `lwlock` / `wal` / `checkpoint` / `clog` / `smgr` /
+  `transaction` / `statement` / `buffer` 13 个真实有 USDT probe 的子系统。
 - denylist hard-deny pattern 放 `denylist.usdt_probe_patterns`,语义见下方「denylist 语义」段
 
 ## 给 feat-069/A5 的接口契约
