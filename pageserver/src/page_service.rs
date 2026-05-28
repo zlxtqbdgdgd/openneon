@@ -32,7 +32,7 @@ use pageserver_api::pagestream_api::{
     PagestreamErrorResponse, PagestreamExistsRequest, PagestreamExistsResponse,
     PagestreamFeMessage, PagestreamGetPageRequest, PagestreamGetSlruSegmentRequest,
     PagestreamGetSlruSegmentResponse, PagestreamNblocksRequest, PagestreamNblocksResponse,
-    PagestreamProtocolVersion, PagestreamRequest, TraceContext,
+    PagestreamProtocolVersion, PagestreamRequest,
 };
 use pageserver_api::reltag::SlruKind;
 use pageserver_api::shard::TenantShardId;
@@ -961,21 +961,6 @@ impl PageServerHandler {
         )
     }
 
-    /// feat-033: extract the optional W3C TraceContext from any pagestream FE message. All
-    /// variants store it on `hdr.trace_context`, so this is a small helper to avoid duplicating
-    /// the match arms wherever we need it (currently only `pagestream_read_message`).
-    fn fe_msg_trace_context(msg: &PagestreamFeMessage) -> Option<TraceContext> {
-        match msg {
-            PagestreamFeMessage::Exists(r) => r.hdr.trace_context,
-            PagestreamFeMessage::Nblocks(r) => r.hdr.trace_context,
-            PagestreamFeMessage::GetPage(r) => r.hdr.trace_context,
-            PagestreamFeMessage::DbSize(r) => r.hdr.trace_context,
-            PagestreamFeMessage::GetSlruSegment(r) => r.hdr.trace_context,
-            #[cfg(feature = "testing")]
-            PagestreamFeMessage::Test(r) => r.hdr.trace_context,
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn pagestream_read_message<IO>(
         pgb: &mut PostgresBackendReader<IO>,
@@ -1023,28 +1008,6 @@ impl PageServerHandler {
         // parse request
         let neon_fe_msg =
             PagestreamFeMessage::parse(&mut copy_data_bytes.reader(), protocol_version)?;
-
-        // feat-033: link the local server-side span to the parent traceparent (if any) so
-        // tracing-opentelemetry (configured by feat-031) exports a span attached to the same
-        // OTel trace_id the compute originated. We do NOT re-sample here (ADR-0010 Q3
-        // head-based propagation).
-        //
-        // The traceparent fields are recorded as well-known `otel.*` keys so that the
-        // tracing-opentelemetry bridge wires them straight to OTel SpanContext on export.
-        let parent_span = if let Some(tc) = Self::fe_msg_trace_context(&neon_fe_msg) {
-            let trace_id_hex = hex::encode(tc.trace_id);
-            let parent_span_id_hex = hex::encode(tc.parent_id);
-            tracing::info_span!(
-                parent: &parent_span,
-                "pagestream_request_with_traceparent",
-                otel.trace_id = %trace_id_hex,
-                otel.parent_span_id = %parent_span_id_hex,
-                otel.trace_flags = tc.trace_flags,
-                otel.sampled = tc.is_sampled(),
-            )
-        } else {
-            parent_span
-        };
 
         let batched_msg = match neon_fe_msg {
             PagestreamFeMessage::Exists(req) => {
@@ -3067,14 +3030,6 @@ impl PageServiceCmd {
                 other,
                 PagestreamProtocolVersion::V3,
             )?)),
-            // feat-033: V4 adds an optional W3C TraceContext (traceparent) prefix per request.
-            // A V3 pageserver receiving "pagestream_v4" will hit the catch-all below and return
-            // an error to the client, which then re-dials with "pagestream_v3" (negotiation
-            // downgrade lives in pgxn/neon/libpagestore.c).
-            "pagestream_v4" => Ok(Self::PageStream(PageStreamCmd::parse(
-                other,
-                PagestreamProtocolVersion::V4,
-            )?)),
             "basebackup" => Ok(Self::BaseBackup(BaseBackupCmd::parse(other)?)),
             "fullbackup" => Ok(Self::FullBackup(FullBackupCmd::parse(other)?)),
             "lease" => {
@@ -3235,7 +3190,6 @@ where
                 let command_kind = match protocol_version {
                     PagestreamProtocolVersion::V2 => ComputeCommandKind::PageStreamV2,
                     PagestreamProtocolVersion::V3 => ComputeCommandKind::PageStreamV3,
-                    PagestreamProtocolVersion::V4 => ComputeCommandKind::PageStreamV4,
                 };
                 COMPUTE_COMMANDS_COUNTERS.for_command(command_kind).inc();
 
@@ -3495,9 +3449,6 @@ impl GrpcPageServiceHandler {
             not_modified_since: read_lsn
                 .not_modified_since_lsn
                 .unwrap_or(read_lsn.request_lsn),
-            // gRPC entry path does not yet propagate traceparent; will be wired up alongside
-            // the gRPC trace-context extractor in a follow-up. Tests use Default::default.
-            trace_context: None,
         }
     }
 

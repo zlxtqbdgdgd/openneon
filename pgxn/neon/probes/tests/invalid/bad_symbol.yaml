@@ -1,0 +1,7 @@
+# reject 原因：symbol 含非法字符 (空格 + 不在 pattern 允许集) · 同时缺 module
+version: 1
+uprobe:
+  - binary: pageserver
+    symbol: "no spaces allowed!@#"
+    type: sync_fn
+    is_async: false

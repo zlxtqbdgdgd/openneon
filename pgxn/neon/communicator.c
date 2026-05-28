@@ -1481,44 +1481,14 @@ page_server_request(void const *req)
 
 
 StringInfoData
-nm_pack_request(NeonRequest *msg, int protocol_version)
+nm_pack_request(NeonRequest *msg)
 {
 	StringInfoData s;
 
 	initStringInfo(&s);
 
 	pq_sendbyte(&s, msg->tag);
-
-	/*
-	 * feat-033 / issue #22: V4 wire inserts an optional W3C TraceContext header right
-	 * after the tag byte (and before the rest of the per-request fields). Wire layout:
-	 *
-	 *   tag(1) trace_present(1) [traceparent_wire(55)?] reqid(8) lsn(8) nlm_since(8) <body>
-	 *
-	 * `trace_present` is 0x00 or 0x01. When 0x01, the next TRACE_CONTEXT_WIRE_LEN (55)
-	 * bytes hold the canonical lowercase W3C "00-<32 hex>-<16 hex>-<2 hex>" form (no NUL).
-	 * Keep this byte-for-byte in lock-step with the Rust parser in
-	 * libs/pageserver_api/src/pagestream_api.rs.
-	 */
-	if (protocol_version >= 4)
-	{
-		if (msg->has_trace_context)
-		{
-			char wire[TRACE_CONTEXT_BUF_SIZE];
-			int wire_len = trace_context_serialize(&msg->trace_context,
-												   wire, sizeof(wire));
-			if (wire_len != TRACE_CONTEXT_WIRE_LEN)
-				neon_log(PANIC, "trace_context_serialize returned %d, expected %d",
-						 wire_len, TRACE_CONTEXT_WIRE_LEN);
-			pq_sendbyte(&s, 1);
-			pq_sendbytes(&s, wire, TRACE_CONTEXT_WIRE_LEN);
-		}
-		else
-		{
-			pq_sendbyte(&s, 0);
-		}
-	}
-	if (protocol_version >= 3)
+	if (neon_protocol_version >= 3)
 	{
 		pq_sendint64(&s, msg->reqid);
 	}

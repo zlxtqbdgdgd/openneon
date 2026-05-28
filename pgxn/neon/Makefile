@@ -142,3 +142,21 @@ check-jsonlog-ext:
 		-I$(srcdir) -o $(srcdir)/test/test_jsonlog_ext \
 		$(srcdir)/test/test_jsonlog_ext.c $(srcdir)/jsonlog_ext.c
 	$(srcdir)/test/test_jsonlog_ext
+
+# ---------------------------------------------------------------------------
+# Standalone check target for the dynamic probe whitelist/denylist schema
+# (feat-067 anchor A0b · 跟平行 PR #40 (A0a feat-033) check-trace-context
+# 同级 / 同位置 / 同前缀 · 跨 anchor 测试入口纪律统一 · R2/N1)。
+#
+# 用法:
+#     make -C pgxn/neon check-probes
+#
+# 跑全套 fixture 校验 (合法 + 非法) · 走仓根 scripts/validate_whitelist.py。
+# 依赖: python3 + PyYAML + jsonschema (pip install pyyaml jsonschema)。
+#
+# 不依赖 PGXS / pg_install / cargo · CI 在装好 python 依赖的环境里直接跑。
+# ---------------------------------------------------------------------------
+
+.PHONY: check-probes
+check-probes:
+	bash $(srcdir)/probes/tests/run_tests.sh

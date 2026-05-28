@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Neon Dynamic Probe Whitelist Schema",
+  "description": "白名单/黑名单 schema · 跨 feat-067 (PG USDT) 和 feat-069 (Rust uprobe) 共享 · 供 feat-068 mcp tool 加载",
+  "type": "object",
+  "required": [
+    "version"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "enum": [
+        1
+      ],
+      "description": "Schema 版本 · 当前只接受 1 · 未来不兼容变更必须 bump"
+    },
+    "usdt": {
+      "type": "array",
+      "description": "USDT (User Statically Defined Tracepoint) 白名单 · 主要供 feat-067 PG 侧使用 · 也允许 feat-069 Rust 侧 usdt crate 加点条目复用",
+      "items": {
+        "$ref": "#/definitions/usdtEntry"
+      }
+    },
+    "uprobe": {
+      "type": "array",
+      "description": "uprobe 白名单 · 主要供 feat-069 Rust 同步函数使用 · 按 binary + symbol attach",
+      "items": {
+        "$ref": "#/definitions/uprobeEntry"
+      }
+    },
+    "denylist": {
+      "type": "object",
+      "description": "黑名单 · 永不允许 attach · denylist 语义覆盖 whitelist (任一 entry 命中即拒绝)",
+      "additionalProperties": false,
+      "properties": {
+        "usdt_probe_patterns": {
+          "type": "array",
+          "description": "USDT probe 名称 regex 黑名单 (例: '^pg_md5_hash.*')",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "uprobe_symbol_patterns": {
+          "type": "array",
+          "description": "uprobe 符号 regex 黑名单 (例: '.*::scram_.*')",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "usdtEntry": {
+      "type": "object",
+      "required": [
+        "target",
+        "probe_name",
+        "subsystem"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": [
+            "postgresql",
+            "pageserver",
+            "safekeeper",
+            "proxy",
+            "local_proxy",
+            "pg_sni_router"
+          ],
+          "description": "宿主进程 · feat-067 用 postgresql · feat-069 usdt crate 加点用 pageserver/safekeeper/proxy"
+        },
+        "probe_name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*(__[a-z][a-z0-9_]+)*$",
+          "description": "USDT probe 名 · 强制 <provider>:<probe> 前缀 (PG 侧 provider=postgresql,Rust usdt crate 侧 provider=neon_pageserver/neon_safekeeper/neon_proxy 等) · 段间用双下划线 · 禁空段 (R2/M3+N4)"
+        },
+        "pg_version_min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 10,
+          "maximum": 99,
+          "description": "最低 PG 主版本号 · null 表示不限"
+        },
+        "pg_version_max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 10,
+          "maximum": 99,
+          "description": "最高 PG 主版本号 · null 表示不限"
+        },
+        "sample_overhead_ns_estimate": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "attach 后每次命中估算的 overhead · 单位 ns · null 表示未测"
+        },
+        "subsystem": {
+          "type": "string",
+          "enum": [
+            "parser",
+            "rewriter",
+            "planner",
+            "executor",
+            "lock",
+            "lwlock",
+            "storage",
+            "wal",
+            "checkpoint",
+            "clog",
+            "transaction",
+            "statement",
+            "smgr",
+            "bgwriter",
+            "buffer",
+            "autovacuum",
+            "wal_sender",
+            "wal_receiver",
+            "syscache",
+            "pageserver",
+            "safekeeper",
+            "proxy",
+            "other"
+          ],
+          "description": "归属子系统 · 用于 mcp tool 按主题分组 · 22 类业务子系统 + other 兜底 = 23 个 enum"
+        },
+        "args": {
+          "type": "array",
+          "description": "probe 参数声明 (signature 文档化用 · 不参与 attach)",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "notes": {
+          "type": "string",
+          "description": "备注 · 例如 hot path 警告"
+        }
+      }
+    },
+    "uprobeEntry": {
+      "type": "object",
+      "required": [
+        "binary",
+        "symbol",
+        "module",
+        "type",
+        "is_async"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "binary": {
+          "type": "string",
+          "enum": [
+            "pageserver",
+            "safekeeper",
+            "proxy",
+            "local_proxy",
+            "pg_sni_router"
+          ],
+          "description": "目标 binary · neon Rust 4 组件 + local_proxy + pg_sni_router"
+        },
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(<[^<>]+>)?(::[A-Za-z_][A-Za-z0-9_]*(<[^<>]+>)?)*$",
+          "description": "Rust 符号名 · 支持 module::path::Type::method · 泛型整体作可选组 (<...>) · 非泛型节禁含空格/分隔符,堵 R2/M1+N5 (空格泄漏 + 不平衡尖括号)"
+        },
+        "module": {
+          "type": "string",
+          "minLength": 1,
+          "description": "符号所属顶层 crate / module 路径前缀 (如 'pageserver::tenant::timeline')"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "sync_fn",
+            "method",
+            "trait_impl",
+            "closure"
+          ],
+          "description": "符号类型分类 · L3 不允许 async_fn (语义解释问题)"
+        },
+        "is_async": {
+          "type": "boolean",
+          "enum": [
+            false
+          ],
+          "description": "L3 白名单只允许同步函数 · async fn 内部 L4 候选 · 此字段必须 false"
+        },
+        "estimated_overhead_ns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "attach 后每次命中估算的 overhead · 单位 ns · null 表示未测"
+        },
+        "address_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "符号内偏移 (可选 · 默认 0 即函数入口)"
+        },
+        "notes": {
+          "type": "string",
+          "description": "备注"
+        }
+      }
+    }
+  }
+}

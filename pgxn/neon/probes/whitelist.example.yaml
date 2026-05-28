@@ -1,0 +1,87 @@
+# 合法 fixture · anchor PR 自带最小演示 · A4/A5 实际白名单内容在各自 PR 填
+# schema 版本与字段语义见 ./whitelist.schema.json
+version: 1
+
+usdt:
+  # feat-067 · PG 上游 USDT (probes.h 中的一段示例 · 完整 30+ 由 A4 填)
+  - target: postgresql
+    probe_name: "postgresql:query__start"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "char *query_string"
+    notes: "PG query 执行入口 · 上游静态 probe"
+
+  - target: postgresql
+    probe_name: "postgresql:query__done"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "char *query_string"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__acquire"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    notes: "hot path · attach 前用 sample 模式评估 overhead"
+
+  # feat-069 · Rust 侧 usdt crate 选择性加点示例 (A5 会扩到 ~10 个)
+  - target: pageserver
+    probe_name: "neon_pageserver:get_page_at_lsn__start"
+    subsystem: pageserver
+    sample_overhead_ns_estimate: 30
+    args:
+      - "tenant_id: &str"
+      - "timeline_id: &str"
+      - "lsn: u64"
+
+uprobe:
+  # feat-069 · Rust 同步函数 uprobe 白名单示例 (A5 填全)
+  - binary: pageserver
+    symbol: "pageserver::tenant::timeline::Timeline::get_page_at_lsn"
+    module: "pageserver::tenant::timeline"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 200
+    notes: "同步版本 · 不是 async fn poll() · L3 范围内"
+
+  - binary: safekeeper
+    symbol: "safekeeper::wal_storage::WalStorage::write_wal"
+    module: "safekeeper::wal_storage"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 150
+
+  - binary: proxy
+    symbol: "proxy::auth::AuthFlow::authenticate_sync"
+    module: "proxy::auth"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 100
+
+denylist:
+  # denylist 语义：任一 pattern 命中即拒绝 attach · 覆盖 whitelist
+  # PG 侧 (feat-067/#2 验收门指定 7 类)
+  usdt_probe_patterns:
+    - "^pg_md5_hash.*"
+    - "^scram_.*"
+    - "^be_tls_.*"
+    - "^be_gssapi_.*"
+    - "^get_role_password$"
+    - "^verify_token$"
+    - "^check_password_hash$"
+
+  # Rust 侧 (feat-069/#2 验收门指定 6 类 crypto pattern)
+  uprobe_symbol_patterns:
+    - ".*::scram_.*"
+    - ".*::sasl::.*"
+    - ".*::tls::handshake.*"
+    - ".*::password::.*"
+    - ".*::token::verify.*"
+    - ".*::crypto::aead.*"

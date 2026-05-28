@@ -355,34 +355,6 @@ pub fn write_postgres_conf(
 
     writeln!(file, "neon.extension_server_port={extension_server_port}")?;
 
-    // feat-039/#3: 冷启 warming_up 状态机 3 GUC (ADR-0013 退出条件) 默认值。
-    // 这些 GUC 由 neon extension (C) 端 DefineCustomXxxVariable 注册;此处给出
-    // compute_tools 默认值,operator 可在 policy.yaml 里覆盖 (落地到
-    // ComputeSpec.cluster.settings 同名 key,上面 as_pg_settings() 会先写,
-    // 这里 settings 已含则不重复写,避免一行 GUC 出现两次)。
-    writeln!(file, "# feat-039: warming_up state machine GUC defaults")?;
-    if spec.cluster.settings.find("neon.warming_up_min_seconds").is_none() {
-        writeln!(
-            file,
-            "neon.warming_up_min_seconds={}",
-            crate::warming_up::defaults::WARMING_UP_MIN_SECONDS
-        )?;
-    }
-    if spec.cluster.settings.find("neon.warming_up_lfc_target").is_none() {
-        writeln!(
-            file,
-            "neon.warming_up_lfc_target={}",
-            crate::warming_up::defaults::WARMING_UP_LFC_TARGET
-        )?;
-    }
-    if spec.cluster.settings.find("neon.warming_up_max_seconds").is_none() {
-        writeln!(
-            file,
-            "neon.warming_up_max_seconds={}",
-            crate::warming_up::defaults::WARMING_UP_MAX_SECONDS
-        )?;
-    }
-
     if spec.drop_subscriptions_before_start {
         writeln!(file, "neon.disable_logical_replication_subscribers=true")?;
     } else {
