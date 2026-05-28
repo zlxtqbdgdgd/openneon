@@ -120,3 +120,18 @@ include $(PGXS)
 .PHONY: check-probes
 check-probes:
 	bash $(srcdir)/probes/tests/run_tests.sh
+
+# ---------------------------------------------------------------------------
+# feat-069 · Rust uprobe 白名单 + 符号暴露 5-case fixture
+#
+# 用法:
+#     make -C pgxn/neon check-feat069
+#
+# 跑 5 case (Cargo profile / uprobe attach stage / USDT note stage /
+# 白名单 denylist 静态文件 / async fn 屏障)
+# 依赖: python3 + PyYAML + jsonschema (与 check-probes 同)
+# ---------------------------------------------------------------------------
+
+.PHONY: check-feat069
+check-feat069:
+	bash $(srcdir)/probes/tests/feat069_fixtures.sh

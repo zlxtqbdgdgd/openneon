@@ -311,7 +311,14 @@ tokio-postgres = { git = "https://github.com/neondatabase/rust-postgres.git", br
 # Besides, debug info should not affect the performance.
 #
 # NB: we also enable frame pointers for improved profiling, see .cargo/config.toml.
-debug = true
+#
+# feat-069/#33 · uprobe 白名单基建 ·
+#   - strip = "none"        keep 符号 (uprobe attach 必需 · readelf -s 可见)
+#   - split-debuginfo=packed  独立 .dwp file (核心 binary 0 增量 · .dwp ≈ 70-100MB)
+#   - debug = "limited"      仅 line table (减小 .dwp 大小; uprobe 仍可按符号 attach)
+strip = "none"
+split-debuginfo = "packed"
+debug = "limited"
 
 # disable debug symbols for all packages except this one to decrease binaries size
 [profile.release.package."*"]

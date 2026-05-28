@@ -1,0 +1,34 @@
+# feat-069/#34 · Rust usdt crate provider 定义 (standalone · 非 workspace member)
+#
+# 为何 standalone (不进 workspace)?
+#   - workspace 资源跨 binary 编译影响面广 · 本 PR 保守只落 provider 定义骨架
+#   - feat-068 mcp tool attach 阶段把此 crate 引入 pageserver/safekeeper/proxy
+#     (lib.rs 加 pub use neon_probes; · 链接器即把 USDT note 拉进 ELF)
+#   - 在那之前已可独立 cargo check + 单测验证 provider 宏展开正确
+#
+# 怎么验:
+#   cd pgxn/neon/probes/rust && cargo check --release && cargo test
+#   readelf -n target/release/libneon_probes.rlib  (Linux only · 看 USDT note section)
+
+[package]
+name = "neon_probes"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "feat-069 · Rust usdt crate hot path provider 集中定义 · 跨 pageserver/safekeeper/proxy 共享 probe 命名"
+
+[lib]
+name = "neon_probes"
+path = "src/lib.rs"
+
+[features]
+# 默认空 · usdt 仅在 Linux 平台启用 (cfg-gate)
+default = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Oxide Computer 的 usdt crate · 在 Linux 上展开成真正的 SDT note section
+# macOS dev 环境不引入此依赖 · 避免 dtrace toolchain 依赖
+usdt = { version = "0.5", default-features = false, features = ["asm"] }
+
+[dev-dependencies]
+# 单测验证 provider 宏可展开
