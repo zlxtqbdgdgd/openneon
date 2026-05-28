@@ -2,6 +2,9 @@
 
 
 MODULE_big = neon
+# 注: 本 OBJS 列表保持字母序。rebase 上游 neon 时, 若上游也在
+# relsize_cache.o ~ unstable_extensions.o 区间加新 .o, trace_context.o 这
+# 一行可能产生上下文冲突 — 解冲突时把它按字母序保留在 r 与 u 之间即可。
 OBJS = \
 	$(WIN32RES) \
 	communicator.o \
@@ -113,13 +116,9 @@ include $(PGXS)
 # 系统 gcc 编出来跑单测。后续 feat-033 / 034 / 035 / 065 在 libpq /
 # libpagestore / proxy 各自 wire-up 时 #include "trace_context.h" 复用。
 #
-# 用法:
-#	make -f Makefile check-trace-context
-#
-# 也接入 PGXS installcheck (走系统 gcc, 不依赖 pg_config):
-#	make installcheck   # 不变, 走 PGXS 默认
-#
-# CI / 开发机推荐显式跑 check-trace-context。
+# 注: 本测试是独立 target, 不挂入 PGXS 的 check / installcheck 依赖链
+# (避免引入 running-DB 依赖)。CI / 开发机必须显式调:
+#     make -C pgxn/neon check-trace-context
 # ---------------------------------------------------------------------------
 
 TRACE_CONTEXT_CC ?= cc
