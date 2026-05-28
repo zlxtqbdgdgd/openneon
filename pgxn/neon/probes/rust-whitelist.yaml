@@ -1,0 +1,234 @@
+# feat-069/#34 · Rust uprobe 白名单实充 (覆盖 #33 build profile + #34 hot path)
+#
+# 加载方: feat-068 mcp tool (在 feat-067-whitelist-schema-anchor 锁定 schema)
+# Schema: pgxn/neon/probes/whitelist.schema.json (version=1)
+# 黑名单语义 + 优先级: 见 README §denylist 语义
+#
+# 三道屏障 (feat-069/#35):
+#   1. is_async 强制 false (schema enum [false]) · 任一 entry is_async=true → schema 校验失败
+#   2. mcp tool 加载时再 assert (feat-068 实现)
+#   3. agent description 说明 async fn 不支持 (feat-068 / README)
+#
+# 选词原则: 同步 (非 async 非 .await) · hot path · 不踩 denylist · 不引入新依赖
+
+version: 1
+
+usdt:
+  # Rust usdt crate 选择性加点 (~10 个 hot path) ·
+  # provider 命名: neon_<binary> · probe 名 <provider>:<probe_name>__<边界>
+  # 对应 source 在 pgxn/neon/probes/rust/src/lib.rs · provider 模块定义
+  # (feat-068 attach 时 binary 字段无需重复,但 readelf -n 验证用 provider 名)
+
+  # pageserver hot path · 4 探针 (2 函数 × start/done)
+  - target: pageserver
+    probe_name: "neon_pageserver:get_page_at_lsn__start"
+    subsystem: pageserver
+    sample_overhead_ns_estimate: 30
+    args:
+      - "tenant_id: &str"
+      - "timeline_id: &str"
+      - "lsn: u64"
+    notes: "Timeline::get_page_at_lsn 入口边界 · 跨 layer 读放大测量起点"
+
+  - target: pageserver
+    probe_name: "neon_pageserver:get_page_at_lsn__done"
+    subsystem: pageserver
+    sample_overhead_ns_estimate: 30
+    args:
+      - "latency_ns: u64"
+    notes: "Timeline::get_page_at_lsn 出口边界"
+
+  - target: pageserver
+    probe_name: "neon_pageserver:layer_download__start"
+    subsystem: pageserver
+    sample_overhead_ns_estimate: 50
+    args:
+      - "layer_name: &str"
+    notes: "Layer::download 入口 · 远端拉层耗时起点"
+
+  - target: pageserver
+    probe_name: "neon_pageserver:layer_download__done"
+    subsystem: pageserver
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bytes: u64"
+      - "latency_ns: u64"
+
+  # safekeeper hot path · 2 探针 (WAL append 边界)
+  - target: safekeeper
+    probe_name: "neon_safekeeper:wal_append__start"
+    subsystem: safekeeper
+    sample_overhead_ns_estimate: 40
+    args:
+      - "start_lsn: u64"
+      - "len: u64"
+    notes: "WalStorage::write_wal 入口边界"
+
+  - target: safekeeper
+    probe_name: "neon_safekeeper:wal_append__done"
+    subsystem: safekeeper
+    sample_overhead_ns_estimate: 40
+    args:
+      - "end_lsn: u64"
+      - "latency_ns: u64"
+
+  # proxy hot path · 4 探针 (auth 完成 + connection 边界)
+  - target: proxy
+    probe_name: "neon_proxy:auth__start"
+    subsystem: proxy
+    sample_overhead_ns_estimate: 30
+    args:
+      - "endpoint: &str"
+    notes: "auth flow 入口 · scram/jwt/password 共享起点 · denylist 已禁单步密码哈希"
+
+  - target: proxy
+    probe_name: "neon_proxy:auth__done"
+    subsystem: proxy
+    sample_overhead_ns_estimate: 30
+    args:
+      - "ok: bool"
+      - "latency_ns: u64"
+    notes: "auth flow 出口 · 不暴露密码 / token / SCRAM 中间态"
+
+  - target: proxy
+    probe_name: "neon_proxy:connection__established"
+    subsystem: proxy
+    sample_overhead_ns_estimate: 30
+    args:
+      - "endpoint: &str"
+      - "lsn: u64"
+    notes: "compute connection 建立完成边界 (TLS handshake 后 backend 可用)"
+
+  - target: proxy
+    probe_name: "neon_proxy:connection__closed"
+    subsystem: proxy
+    sample_overhead_ns_estimate: 30
+    args:
+      - "duration_ns: u64"
+
+uprobe:
+  # ============================================================
+  # pageserver · 同步 hot path (6 entry)
+  # ============================================================
+  - binary: pageserver
+    symbol: "pageserver::tenant::storage_layer::delta_layer::DeltaLayer::new_for_path"
+    module: "pageserver::tenant::storage_layer::delta_layer"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 200
+    notes: "DeltaLayer 路径解析 + open · 同步 fs 入口 · 不入 IO 真正读盘 (Layer download 由 USDT 测量)"
+
+  - binary: pageserver
+    symbol: "pageserver::tenant::storage_layer::image_layer::ImageLayer::new_for_path"
+    module: "pageserver::tenant::storage_layer::image_layer"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 200
+    notes: "ImageLayer 路径解析 + open · 与 delta 对称"
+
+  - binary: pageserver
+    symbol: "pageserver::tenant::storage_layer::delta_layer::DeltaLayerWriterInner::ser_into_page"
+    module: "pageserver::tenant::storage_layer::delta_layer"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 150
+    notes: "Summary 序列化 · 写盘 hot path · 同步"
+
+  - binary: pageserver
+    symbol: "pageserver::tenant::storage_layer::image_layer::ImageLayerWriterInner::ser_into_page"
+    module: "pageserver::tenant::storage_layer::image_layer"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 150
+
+  - binary: pageserver
+    symbol: "pageserver::tenant::storage_layer::delta_layer::sort_delta"
+    module: "pageserver::tenant::storage_layer::delta_layer"
+    type: sync_fn
+    is_async: false
+    estimated_overhead_ns: 100
+    notes: "compaction 排序 hot path · 纯 CPU"
+
+  - binary: pageserver
+    symbol: "pageserver::tenant::storage_layer::delta_layer::sort_delta_value"
+    module: "pageserver::tenant::storage_layer::delta_layer"
+    type: sync_fn
+    is_async: false
+    estimated_overhead_ns: 100
+
+  # ============================================================
+  # safekeeper · 同步 hot path (2 entry)
+  # ============================================================
+  - binary: safekeeper
+    symbol: "safekeeper::control_file::FileStorage::write_to_buf"
+    module: "safekeeper::control_file"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 180
+    notes: "control file 序列化 · 同步 · WAL checkpoint 同步 IO 关键路径"
+
+  - binary: safekeeper
+    symbol: "safekeeper::wal_storage::wal_file_paths"
+    module: "safekeeper::wal_storage"
+    type: sync_fn
+    is_async: false
+    estimated_overhead_ns: 80
+    notes: "WAL segment 路径计算 · 每次 append 都会命中 · 同步纯计算"
+
+  # ============================================================
+  # proxy · 同步 hot path (3 entry)
+  # ============================================================
+  - binary: proxy
+    symbol: "proxy::auth::credentials::endpoint_sni"
+    module: "proxy::auth::credentials"
+    type: sync_fn
+    is_async: false
+    estimated_overhead_ns: 80
+    notes: "SNI -> endpoint 解析 · 每连接首包同步 hot path · 不触及密码"
+
+  - binary: proxy
+    symbol: "proxy::auth::credentials::ComputeUserInfoMaybeEndpoint::parse"
+    module: "proxy::auth::credentials"
+    type: method
+    is_async: false
+    estimated_overhead_ns: 120
+    notes: "startup message 解析 · 同步 · denylist password::* 不命中此函数 (此函数只读 user/endpoint 字段)"
+
+  - binary: proxy
+    symbol: "proxy::auth::credentials::check_peer_addr_is_in_list"
+    module: "proxy::auth::credentials"
+    type: sync_fn
+    is_async: false
+    estimated_overhead_ns: 60
+    notes: "IP allowlist 检查 · 每连接同步 · 纯计算"
+
+denylist:
+  # ============================================================
+  # 沿用 anchor README §denylist 给的安全洞清单 ·
+  # A5 在 feat-069/#34 README 留注 auth::* 整段 deny 是 L4 议题 ·
+  # 本 PR 暂保持 anchor 同名 6 类 crypto pattern (sasl/tls/password/token/crypto/scram)
+  # ============================================================
+  usdt_probe_patterns:
+    - "^pg_md5_hash.*"
+    - "^scram_.*"
+    - "^be_tls_.*"
+    - "^be_gssapi_.*"
+    - "^get_role_password$"
+    - "^verify_token$"
+    - "^check_password_hash$"
+
+  uprobe_symbol_patterns:
+    - ".*::scram_.*"
+    - ".*::sasl::.*"
+    - ".*::tls::handshake.*"
+    - ".*::password::.*"
+    - ".*::token::verify.*"
+    - ".*::crypto::aead.*"
+    # R2 元评 (issue#54 comment 4564616746) 补缺 ·
+    # 堵 anchor README §deny 优先级 + 安全洞 里点名的三类
+    # "非 ::password:: 命名空间但含敏感字段" 函数 ·
+    # 用精确模式避免误抓现有合法 whitelist 的 proxy::auth::credentials::* sync 函数 ·
+    # 整段 .*::auth::.* deny 留 L4 (需 feat-068 mcp tool 实现 whitelist override 语义)
+    - ".*::authenticate_password.*"
+    - ".*::authenticate_token.*"
+    - ".*::password_hash_verify.*"

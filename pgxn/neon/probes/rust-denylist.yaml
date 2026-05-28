@@ -1,0 +1,26 @@
+# feat-069/#34 · Rust 侧独立 denylist (6 类 crypto pattern · hard-deny)
+#
+# 用法: 当只想下「denylist 全 deny by default」时直接加载此文件 ·
+# whitelist 段缺省 = 「无白名单 · 全 deny」 (anchor README §denylist 语义已说明)
+#
+# 与 rust-whitelist.yaml 内嵌的 denylist 段保持一致 (同一份 pattern · A5 不扩窄)
+# A5 在 README 留注: auth::* 整段 deny 是 L4 候选 (现阶段保持 anchor 同名 6 类)
+version: 1
+
+denylist:
+  usdt_probe_patterns:
+    - "^pg_md5_hash.*"
+    - "^scram_.*"
+    - "^be_tls_.*"
+    - "^be_gssapi_.*"
+    - "^get_role_password$"
+    - "^verify_token$"
+    - "^check_password_hash$"
+
+  uprobe_symbol_patterns:
+    - ".*::scram_.*"
+    - ".*::sasl::.*"
+    - ".*::tls::handshake.*"
+    - ".*::password::.*"
+    - ".*::token::verify.*"
+    - ".*::crypto::aead.*"
