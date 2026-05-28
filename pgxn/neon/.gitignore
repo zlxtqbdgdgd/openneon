@@ -1,0 +1,5 @@
+# feat-036 · standalone unit test binaries (built by make check-jsonlog-ext)
+/test/test_jsonlog_ext
+# Future feat-034 anchor / feat-037 standalone tests will follow the same pattern.
+/test/test_trace_context
+/test/test_sqlcommenter
