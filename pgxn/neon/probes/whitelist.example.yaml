@@ -5,7 +5,7 @@ version: 1
 usdt:
   # feat-067 · PG 上游 USDT (probes.h 中的一段示例 · 完整 30+ 由 A4 填)
   - target: postgresql
-    probe_name: "query__start"
+    probe_name: "postgresql:query__start"
     subsystem: executor
     pg_version_min: 14
     pg_version_max: null
@@ -15,7 +15,7 @@ usdt:
     notes: "PG query 执行入口 · 上游静态 probe"
 
   - target: postgresql
-    probe_name: "query__done"
+    probe_name: "postgresql:query__done"
     subsystem: executor
     pg_version_min: 14
     pg_version_max: null
@@ -24,7 +24,7 @@ usdt:
       - "char *query_string"
 
   - target: postgresql
-    probe_name: "lwlock__acquire"
+    probe_name: "postgresql:lwlock__acquire"
     subsystem: lwlock
     pg_version_min: 14
     pg_version_max: null

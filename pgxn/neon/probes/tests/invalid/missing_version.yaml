@@ -1,5 +1,5 @@
 # reject 原因：顶层缺 version 字段
 usdt:
   - target: postgresql
-    probe_name: "query__start"
+    probe_name: "postgresql:query__start"
     subsystem: executor

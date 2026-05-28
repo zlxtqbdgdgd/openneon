@@ -1,0 +1,7 @@
+# reject 原因：uprobe entry 缺 type 字段 (R2/M2 · type 现要求必填)
+version: 1
+uprobe:
+  - binary: pageserver
+    symbol: "pageserver::tenant::timeline::Timeline::get_page_at_lsn"
+    module: "pageserver::tenant::timeline"
+    is_async: false

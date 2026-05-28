@@ -2,5 +2,5 @@
 version: 1
 usdt:
   - target: postgresql
-    probe_name: "query__start"
+    probe_name: "postgresql:query__start"
     subsystem: magic
