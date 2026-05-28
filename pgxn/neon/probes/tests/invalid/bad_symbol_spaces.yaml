@@ -1,0 +1,9 @@
+# reject 原因：symbol pattern 不允许在非泛型节包含空格 (R2/M1)
+# 这条 fixture 必须靠新 pattern 拒,旧 pattern 会通过
+version: 1
+uprobe:
+  - binary: pageserver
+    symbol: "proxy::auth::method name with spaces"
+    module: "proxy::auth"
+    type: sync_fn
+    is_async: false

@@ -1,0 +1,9 @@
+# reject 原因：pg_version_min(17) > pg_version_max(14) · 跨字段逻辑校验 (R1/S2)
+# schema 层不支持跨字段比较 · 由 validate_whitelist.py 第二阶段拒绝
+version: 1
+usdt:
+  - target: postgresql
+    probe_name: "postgresql:query__start"
+    subsystem: executor
+    pg_version_min: 17
+    pg_version_max: 14

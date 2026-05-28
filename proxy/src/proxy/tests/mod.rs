@@ -2,7 +2,6 @@
 #![allow(clippy::unimplemented)]
 
 mod mitm;
-mod trace_context;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -77,17 +77,7 @@ char	   *neon_auth_token;
 int			readahead_buffer_size = 128;
 int			flush_every_n_requests = 8;
 
-/*
- * feat-033 / issue #22: default bumped from 3 to 4 so a v4-aware compute prefers the
- * traceparent-carrying wire when talking to a v4-aware pageserver. Negotiation downgrade
- * to v3 lives in pageserver_connect() below: on a "pagestream_v4" command rejection by an
- * older pageserver we fall back to v3 for the lifetime of this shard connection.
- *
- * The GUC range is [NEON_PROTOCOL_VERSION_MIN, NEON_PROTOCOL_VERSION_LATEST] (see
- * pagestore_client.h). Bumping the max here MUST go with a matching enum arm in
- * `PagestreamProtocolVersion` and a `pagestream_vN` query name in page_service.rs.
- */
-int         neon_protocol_version = NEON_PROTOCOL_VERSION_LATEST;
+int         neon_protocol_version = 3;
 
 static int	neon_compute_mode = 0;
 static int	max_reconnect_attempts = 60;
@@ -184,18 +174,6 @@ typedef struct
 	 *	- WL_EXIT_ON_PM_DEATH.
 	 */
 	WaitEventSet   *wes_read;
-
-	/*
-	 * feat-033 / issue #22: the wire protocol version actually in use on this shard
-	 * connection. We start each connect attempt at the GUC (`neon_protocol_version`,
-	 * default = NEON_PROTOCOL_VERSION_LATEST) and ratchet *down* if the pageserver rejects
-	 * the chosen "pagestream_vN" command — but never above the GUC and never below
-	 * NEON_PROTOCOL_VERSION_MIN. The downgrade is sticky for the lifetime of this shard
-	 * struct so that subsequent reconnects to the same pageserver don't keep tripping the
-	 * same negotiation. It's reset back to the GUC value when neon_pageserver_disconnect()
-	 * is called explicitly (e.g. on configuration refresh).
-	 */
-	int			negotiated_protocol_version;
 } PageServer;
 
 static uint32 local_request_counter;
@@ -706,28 +684,8 @@ pageserver_connect(shardno_t shard_no, int elevel)
 		AddWaitEventToSet(shard->wes_read, WL_SOCKET_READABLE, PQsocket(shard->conn), NULL, NULL);
 
 
-		/*
-		 * feat-033 / issue #22: start each connect attempt at the configured GUC version
-		 * (or whatever the negotiation downgrade last left us with, see
-		 * negotiated_protocol_version above). The v4 -> v3 downgrade happens further down
-		 * once we see whether the server accepts the "pagestream_v4" command.
-		 *
-		 * Initialise from the GUC the first time we connect this shard, or whenever an
-		 * explicit disconnect cleared it.
-		 */
-		if (shard->negotiated_protocol_version == 0)
-			shard->negotiated_protocol_version = neon_protocol_version;
-		/* Cap so we never advertise above what this build supports. */
-		if (shard->negotiated_protocol_version > NEON_PROTOCOL_VERSION_LATEST)
-			shard->negotiated_protocol_version = NEON_PROTOCOL_VERSION_LATEST;
-		if (shard->negotiated_protocol_version < NEON_PROTOCOL_VERSION_MIN)
-			shard->negotiated_protocol_version = NEON_PROTOCOL_VERSION_MIN;
-
-		switch (shard->negotiated_protocol_version)
+		switch (neon_protocol_version)
 		{
-		case 4:
-			pagestream_query = psprintf("pagestream_v4 %s %s", neon_tenant, neon_timeline);
-			break;
 		case 3:
 			pagestream_query = psprintf("pagestream_v3 %s %s", neon_tenant, neon_timeline);
 			break;
@@ -735,8 +693,7 @@ pageserver_connect(shardno_t shard_no, int elevel)
 			pagestream_query = psprintf("pagestream_v2 %s %s", neon_tenant, neon_timeline);
 			break;
 		default:
-			elog(ERROR, "unexpected negotiated_protocol_version %d",
-				 shard->negotiated_protocol_version);
+			elog(ERROR, "unexpected neon_protocol_version %d", neon_protocol_version);
 		}
 
 		if (PQstatus(shard->conn) == CONNECTION_BAD)
@@ -809,68 +766,6 @@ pageserver_connect(shardno_t shard_no, int elevel)
 			}
 		}
 
-		/*
-		 * feat-033 / issue #22: peek at the first PQresult so that we can detect a
-		 * "pagestream_vN unsupported" rejection from an older pageserver and downgrade
-		 * once. In the happy path the next PQresult is a PGRES_COPY_BOTH (the pagestream
-		 * has started) which we leave on the queue — the existing nm_pack_request /
-		 * PQputCopyData / call_PQgetCopyData path consumes the rest of the conversation.
-		 *
-		 * In the failure path we get PGRES_FATAL_ERROR (or PGRES_NONFATAL_ERROR for older
-		 * pg) carrying the server's "unsupported command pagestream_v4" message. If we
-		 * were trying v4 we silently downgrade to v3 for the rest of this shard's
-		 * lifetime and let the outer pageserver_send() retry loop reconnect.
-		 */
-		{
-			PGresult   *res = PQgetResult(shard->conn);
-			ExecStatusType status = res ? PQresultStatus(res) : PGRES_FATAL_ERROR;
-
-			if (status == PGRES_COPY_BOTH)
-			{
-				/* All good: pageserver accepted the pagestream_vN command. */
-				PQclear(res);
-			}
-			else
-			{
-				char *errmsg_copy = res ? pchomp(PQresultErrorMessage(res))
-									   : pchomp(PQerrorMessage(shard->conn));
-				if (res)
-					PQclear(res);
-
-				/* Drain any further results so a future PQfinish doesn't trip. */
-				while ((res = PQgetResult(shard->conn)) != NULL)
-					PQclear(res);
-
-				if (shard->negotiated_protocol_version > NEON_PROTOCOL_VERSION_MIN
-					&& shard->negotiated_protocol_version > 3)
-				{
-					/*
-					 * Downgrade v4 -> v3 once. We keep negotiated_protocol_version
-					 * sticky at 3 so reconnects to the same pageserver skip the
-					 * pagestream_v4 probe.
-					 */
-					neon_shard_log(shard_no, LOG,
-								   "libpagestore: pageserver rejected pagestream_v%d "
-								   "(%s); downgrading to pagestream_v3",
-								   shard->negotiated_protocol_version, errmsg_copy);
-					shard->negotiated_protocol_version = 3;
-					CLEANUP_AND_DISCONNECT(shard);
-					pfree(errmsg_copy);
-					/* Let the outer caller retry; we're back at PS_Disconnected. */
-					return false;
-				}
-
-				CLEANUP_AND_DISCONNECT(shard);
-				ereport(elevel,
-						(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-						 errmsg(NEON_TAG "[shard %d] pageserver rejected pagestream handshake",
-								shard_no),
-						 errdetail_internal("%s", errmsg_copy)));
-				pfree(errmsg_copy);
-				return false;
-			}
-		}
-
 		shard->state = PS_Connected;
 		shard->nrequests_sent = 0;
 		shard->nresponses_received = 0;
@@ -887,11 +782,7 @@ pageserver_connect(shardno_t shard_no, int elevel)
 		shard->delay_us = MIN_RECONNECT_INTERVAL_USEC;
 
 		neon_shard_log(shard_no, DEBUG5, "Connection state: Connected");
-		neon_shard_log(shard_no, LOG,
-					   "libpagestore: connected to '%s' with protocol version %d "
-					   "(GUC=%d, negotiated=%d)",
-					   connstr, shard->negotiated_protocol_version,
-					   neon_protocol_version, shard->negotiated_protocol_version);
+		neon_shard_log(shard_no, LOG, "libpagestore: connected to '%s' with protocol version %d", connstr, neon_protocol_version);
 		return true;
 	default:
 		neon_shard_log(shard_no, ERROR, "libpagestore: invalid connection state %d", shard->state);
@@ -1258,16 +1149,7 @@ pageserver_send(shardno_t shard_no, NeonRequest *request)
 	}
 
 	request->reqid = GENERATE_REQUEST_ID();
-	/*
-	 * Pack with the wire version this shard actually negotiated (issue #22 negotiation
-	 * downgrade). If we somehow get here before pageserver_connect populated it (which
-	 * shouldn't happen — the state-machine guards above ensure PS_Connected before send),
-	 * fall back to the GUC.
-	 */
-	req_buff = nm_pack_request(request,
-							   shard->negotiated_protocol_version > 0
-							   ? shard->negotiated_protocol_version
-							   : neon_protocol_version);
+	req_buff = nm_pack_request(request);
 
 	/*
 	 * If pageserver is stopped, the connections from compute node are broken.
@@ -1697,15 +1579,11 @@ pg_init_libpagestore(void)
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("neon.protocol_version",
 							"Version of compute<->page server protocol",
-							"4 = libpq pagestream w/ optional W3C traceparent prefix "
-							"(feat-033). 3 = pagestream w/ request_id. 2 = legacy "
-							"pagestream without request_id. v4 negotiates down to v3 "
-							"at connect time when the pageserver does not accept "
-							"\"pagestream_v4\".",
+							NULL,
 							&neon_protocol_version,
-							NEON_PROTOCOL_VERSION_LATEST,
-							NEON_PROTOCOL_VERSION_MIN,
-							NEON_PROTOCOL_VERSION_LATEST,
+							3,	/* use protocol version 3 */
+							2,	/* min */
+							3,	/* max */
 							PGC_SU_BACKEND,
 							0,	/* no flags required */
 							NULL, NULL, NULL);

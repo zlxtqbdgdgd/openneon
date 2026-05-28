@@ -30,7 +30,6 @@
 
 pub mod http;
 pub mod perf_span;
-pub mod trace_context;
 pub mod usr;
 
 use opentelemetry::trace::TracerProvider;

@@ -67,16 +67,7 @@ pub fn init_tracing_and_logging(
     // cornerstone 接入点装上：空 UsrContext 在 on_new_span 里早退为 no-op，不影响日志；
     // 具体 endpoint_id / tenant_id 等仍由各 span 字段 / usr_event! 按 canonical schema 注入。
     // UsrLayer 依赖 OpenTelemetryLayer 已注入 OtelData，故必须排在 otlp_layer 之后。
-    //
-    // feat-039/#2: compute 侧 resolver 额外带 warming_up 第 8 维 label。读全局原子
-    // [`crate::warming_up::WARMING_UP_FLAG`](进程级单例,1Hz 状态机更新),让所有
-    // Neon-emit metric / log span 都自动带 `openneon.usr.warming_up=true/false` tag。
-    // pageserver / safekeeper / proxy 共享进程不走这条 (各自 resolver 不填,
-    // UsrContext.warming_up 保持 None → 不贴 label,OQ4)。
-    let usr_layer = tracing_utils::usr::usr_layer(|| tracing_utils::usr::UsrContext {
-        warming_up: Some(crate::warming_up::is_warming_up()),
-        ..Default::default()
-    });
+    let usr_layer = tracing_utils::usr::usr_layer(tracing_utils::usr::UsrContext::default);
 
     // Put it all together
     tracing_subscriber::registry()

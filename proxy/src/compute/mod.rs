@@ -245,46 +245,6 @@ impl AuthInfo {
         }
     }
 
-    /// feat-065/#29: 把 traceparent + tracestate 注入到要发给 compute 的 startup options。
-    ///
-    /// 行为：把 server_params 里既有的 `options` 拼上 `-c neon.traceparent=... -c neon.tracestate=...`
-    /// 之后**整体重建** server_params —— 因为 `StartupMessageParams::insert` 是 append-only，
-    /// 直接 insert 同 key 会得到两条 entry（虽然 PG 会取后一条，但 wire 上不干净）。
-    pub(crate) fn inject_trace_context(&mut self, tc: &crate::trace_context::TraceContext) {
-        let existing = self.server_params.get("options").map(|s| s.to_owned());
-        let new_options = crate::trace_context::inject_into_options(existing.as_deref(), tc);
-
-        // 重建：拷贝所有非 options 项 + 一个新 options 项。
-        let mut rebuilt = StartupMessageParams::default();
-        let mut had_options = false;
-        let pairs: Vec<(String, String)> = self
-            .server_params
-            .iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
-        for (k, v) in pairs {
-            if k == "options" {
-                if !had_options {
-                    rebuilt.insert("options", &new_options);
-                    had_options = true;
-                }
-                // 后续重复的 options 丢弃
-            } else {
-                rebuilt.insert(&k, &v);
-            }
-        }
-        if !had_options {
-            rebuilt.insert("options", &new_options);
-        }
-        self.server_params = rebuilt;
-    }
-
-    /// feat-065 test helper —— 暴露 server_params 给集成测试断言注入后的 options 槽位。
-    #[cfg(test)]
-    pub(crate) fn server_params(&self) -> &StartupMessageParams {
-        &self.server_params
-    }
-
     pub async fn authenticate(
         &self,
         ctx: &RequestContext,

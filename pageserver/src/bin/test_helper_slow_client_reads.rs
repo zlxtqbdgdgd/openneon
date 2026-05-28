@@ -35,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
                 reqid: 0,
                 request_lsn: Lsn(23),
                 not_modified_since: Lsn(23),
-                trace_context: None,
             },
             batch_key: 42,
             message: format!("message {msg}"),

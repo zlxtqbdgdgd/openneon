@@ -34,4 +34,3 @@ mod spec_apply;
 pub mod swap;
 pub mod sync_sk;
 pub mod tls;
-pub mod warming_up;

@@ -604,8 +604,6 @@ impl Client for LibpqClient {
                     reqid: req_id,
                     request_lsn: req_lsn,
                     not_modified_since: mod_lsn,
-                    // pagebench is benchmark tooling; no parent trace to propagate yet.
-                    trace_context: None,
                 },
                 rel,
                 blkno,
