@@ -33,6 +33,8 @@ pub mod recovery;
 pub mod remove_wal;
 pub mod safekeeper;
 pub mod send_interpreted_wal;
+/// feat-009 USR: tenant → shard 映射缓存（出口侧注入 shard_id，不改物理模型）。
+pub mod shard_map_cache;
 pub mod send_wal;
 pub mod state;
 pub mod timeline;

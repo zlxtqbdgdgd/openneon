@@ -35,6 +35,7 @@ use storage_broker::{DEFAULT_ENDPOINT, Uri};
 use tokio::runtime::Handle;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use utils::auth::{JwtAuth, Scope, SwappableJwtAuth};
 use utils::id::NodeId;
@@ -540,9 +541,41 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
 
     let global_timelines = Arc::new(GlobalTimelines::new(conf.clone(), wal_backup.clone()));
 
+    // feat-009 USR: 构造 shard map cache（从 storage_controller pull tenant→shard 映射），
+    // 在出口侧给 per-timeline metric / tracing 补 shard_id。safekeeper 物理模型不动。
+    // hcc_base_url 缺省时 cache 禁用，shard_id 全部降级 "0000"。
+    let shard_map = safekeeper::shard_map_cache::ShardMapCache::new(conf.hcc_base_url.clone());
+    // 注册为进程全局实例，供深层 WAL acceptor tracing span 查询 shard_id。
+    shard_map.install_global();
+    // SIGTERM 时让 shard map 后台刷新优雅退出（与 safekeeper 其它后台任务一致，不 fire-and-forget）。
+    let shard_map_cancel = CancellationToken::new();
+    {
+        // 30s interval 后台刷新（cache miss 不阻塞 WAL flush）。
+        let shard_map = shard_map.clone();
+        let gt = global_timelines.clone();
+        let cancel = shard_map_cancel.clone();
+        BACKGROUND_RUNTIME.handle().spawn(async move {
+            shard_map
+                .run_refresh_loop(
+                    safekeeper::shard_map_cache::DEFAULT_REFRESH_INTERVAL,
+                    cancel,
+                    move || {
+                        gt.get_all()
+                            .iter()
+                            .map(|t| t.ttid.tenant_id)
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect()
+                    },
+                )
+                .await;
+        });
+    }
+
     // Register metrics collector for active timelines. It's important to do this
     // after daemonizing, otherwise process collector will be upset.
-    let timeline_collector = safekeeper::metrics::TimelineCollector::new(global_timelines.clone());
+    let timeline_collector =
+        safekeeper::metrics::TimelineCollector::new(global_timelines.clone(), shard_map.clone());
     metrics::register_internal(Box::new(timeline_collector))?;
 
     // Keep handles to main tasks to die if any of them disappears.
@@ -781,6 +814,9 @@ async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
         _ = sigterm_stream.recv() => info!("received SIGTERM, terminating")
 
     };
+    // 通知 shard map 刷新后台任务优雅退出。进程随后 exit(0)，
+    // 这里 cancel 主要给该 loop 一个干净的 break 点（与其它后台任务的取消语义一致）。
+    shard_map_cancel.cancel();
     std::process::exit(0);
 }
 

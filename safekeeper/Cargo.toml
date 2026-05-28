@@ -12,6 +12,7 @@ testing = ["fail/failpoints"]
 benchmarking = []
 
 [dependencies]
+arc-swap.workspace = true
 async-stream.workspace = true
 anyhow.workspace = true
 byteorder.workspace = true

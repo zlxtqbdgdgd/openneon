@@ -538,6 +538,8 @@ pub struct FullTimelineInfo {
 /// Collects metrics for all active timelines.
 pub struct TimelineCollector {
     global_timelines: Arc<GlobalTimelines>,
+    /// feat-009 USR: tenant → shard 映射，用于在 collect() 时给 per-timeline metric 补 shard_id label。
+    shard_map: Arc<crate::shard_map_cache::ShardMapCache>,
     descs: Vec<Desc>,
     commit_lsn: GenericGaugeVec<AtomicU64>,
     backup_lsn: GenericGaugeVec<AtomicU64>,
@@ -564,7 +566,10 @@ pub struct TimelineCollector {
 }
 
 impl TimelineCollector {
-    pub fn new(global_timelines: Arc<GlobalTimelines>) -> TimelineCollector {
+    pub fn new(
+        global_timelines: Arc<GlobalTimelines>,
+        shard_map: Arc<crate::shard_map_cache::ShardMapCache>,
+    ) -> TimelineCollector {
         let mut descs = Vec::new();
 
         let commit_lsn = GenericGaugeVec::new(
@@ -572,7 +577,7 @@ impl TimelineCollector {
                 "safekeeper_commit_lsn",
                 "Current commit_lsn (not necessarily persisted to disk), grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(commit_lsn.desc().into_iter().cloned());
@@ -582,7 +587,7 @@ impl TimelineCollector {
                 "safekeeper_backup_lsn",
                 "Current backup_lsn, up to which WAL is backed up, grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(backup_lsn.desc().into_iter().cloned());
@@ -592,7 +597,7 @@ impl TimelineCollector {
                 "safekeeper_flush_lsn",
                 "Current flush_lsn, grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(flush_lsn.desc().into_iter().cloned());
@@ -602,7 +607,7 @@ impl TimelineCollector {
                 "safekeeper_epoch_start_lsn",
                 "Point since which compute generates new WAL in the current consensus term",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(epoch_start_lsn.desc().into_iter().cloned());
@@ -612,7 +617,7 @@ impl TimelineCollector {
                 "safekeeper_peer_horizon_lsn",
                 "LSN of the most lagging safekeeper",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(peer_horizon_lsn.desc().into_iter().cloned());
@@ -622,7 +627,7 @@ impl TimelineCollector {
                 "safekeeper_remote_consistent_lsn",
                 "LSN which is persisted to the remote storage in pageserver",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(remote_consistent_lsn.desc().into_iter().cloned());
@@ -632,7 +637,7 @@ impl TimelineCollector {
                 "safekeeper_ps_last_received_lsn",
                 "Last LSN received by the pageserver, acknowledged in the feedback",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(ps_last_received_lsn.desc().into_iter().cloned());
@@ -642,7 +647,7 @@ impl TimelineCollector {
                 "safekeeper_feedback_last_time_seconds",
                 "Timestamp of the last feedback from the pageserver",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(feedback_last_time_seconds.desc().into_iter().cloned());
@@ -652,7 +657,7 @@ impl TimelineCollector {
                 "safekeeper_ps_feedback_count_total",
                 "Number of feedbacks received from the pageserver",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
 
@@ -661,7 +666,7 @@ impl TimelineCollector {
                 "safekeeper_ps_corruption_detected",
                 "1 if corruption was detected in the timeline according to feedback from the pageserver, 0 otherwise",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
 
@@ -670,7 +675,7 @@ impl TimelineCollector {
                 "safekeeper_timeline_active",
                 "Reports 1 for active timelines, 0 for inactive",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(timeline_active.desc().into_iter().cloned());
@@ -680,7 +685,7 @@ impl TimelineCollector {
                 "safekeeper_wal_backup_active",
                 "Reports 1 for timelines with active WAL backup, 0 otherwise",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(wal_backup_active.desc().into_iter().cloned());
@@ -690,7 +695,7 @@ impl TimelineCollector {
                 "safekeeper_connected_computes",
                 "Number of active compute connections",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(connected_computes.desc().into_iter().cloned());
@@ -700,14 +705,14 @@ impl TimelineCollector {
                 "safekeeper_disk_usage_bytes",
                 "Estimated disk space used to store WAL segments",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(disk_usage.desc().into_iter().cloned());
 
         let acceptor_term = GenericGaugeVec::new(
             Opts::new("safekeeper_acceptor_term", "Current consensus term"),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(acceptor_term.desc().into_iter().cloned());
@@ -717,7 +722,7 @@ impl TimelineCollector {
                 "safekeeper_written_wal_bytes_total",
                 "Number of WAL bytes written to disk, grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(written_wal_bytes.desc().into_iter().cloned());
@@ -727,7 +732,7 @@ impl TimelineCollector {
                 "safekeeper_written_wal_seconds_total",
                 "Total time spent in write(2) writing WAL to disk, grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(written_wal_seconds.desc().into_iter().cloned());
@@ -737,7 +742,7 @@ impl TimelineCollector {
                 "safekeeper_flushed_wal_seconds_total",
                 "Total time spent in fsync(2) flushing WAL to disk, grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(flushed_wal_seconds.desc().into_iter().cloned());
@@ -768,13 +773,14 @@ impl TimelineCollector {
                 "safekeeper_interpreted_wal_reader_tasks",
                 "Number of active interpreted wal reader tasks, grouped by timeline",
             ),
-            &["tenant_id", "timeline_id"],
+            &["tenant_id", "timeline_id", "shard_id"],
         )
         .unwrap();
         descs.extend(interpreted_wal_reader_tasks.desc().into_iter().cloned());
 
         TimelineCollector {
             global_timelines,
+            shard_map,
             descs,
             commit_lsn,
             backup_lsn,
@@ -849,7 +855,10 @@ impl Collector for TimelineCollector {
         for tli in &infos {
             let tenant_id = tli.ttid.tenant_id.to_string();
             let timeline_id = tli.ttid.timeline_id.to_string();
-            let labels = &[tenant_id.as_str(), timeline_id.as_str()];
+            // feat-009 USR: 出口侧补 shard_id（从 shard_map_cache 取；cache miss 降级 "0000"）。
+            // safekeeper 物理模型不分 shard，shard_id 仅是出口侧 attribute，0 协议改动。
+            let shard_id = self.shard_map.shard_id_label(&tli.ttid.tenant_id);
+            let labels = &[tenant_id.as_str(), timeline_id.as_str(), shard_id.as_str()];
 
             if tli.timeline_is_active {
                 active_timelines_count += 1;
