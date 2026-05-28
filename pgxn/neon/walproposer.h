@@ -462,6 +462,27 @@ typedef struct WalproposerShmemState
 	XLogRecPtr	safekeeper_remote_consistent_lsn[MAX_SAFEKEEPERS];
 	/* compute-local timestamp of the last AppendResponse mirrored, per sk */
 	TimestampTz	safekeeper_lsn_updated_at[MAX_SAFEKEEPERS];
+
+	/*
+	 * feat-015: cumulative WAL byte counters for neon_perf_counters.
+	 *
+	 * Both are written only by the single walproposer process from
+	 * XLogBroadcastWalProposer, where (endptr - startptr) is the amount of WAL
+	 * broadcast to the safekeepers in one step. In this topology the WAL the
+	 * walproposer produces is exactly the WAL it sends to safekeepers, so both
+	 * advance by the same delta; we keep them as two distinct _total fields to
+	 * match the design's semantics (produced vs. sent). Monotonic; read by
+	 * backends via neon_get_perf_counters() without locking.
+	 *
+	 * pg_atomic_uint64 (not bare uint64): the single walproposer writer and the
+	 * lock-free backend readers live on different CPUs, and on weakly-ordered
+	 * architectures (ARM/POWER) a plain load gives no visibility / ordering
+	 * guarantee. Using the atomics (pg_atomic_fetch_add_u64 on the writer,
+	 * pg_atomic_read_u64 on readers) matches how the other neon shmem shared
+	 * counters in this struct are accessed.
+	 */
+	pg_atomic_uint64	wal_write_bytes_total;
+	pg_atomic_uint64	wal_send_to_safekeeper_bytes_total;
 } WalproposerShmemState;
 
 /*

@@ -639,6 +639,38 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	/* feat-015: per-group rollback flags for widened neon_perf_counters. */
+	DefineCustomBoolVariable(
+							"neon.perf_counters_wal_extra",
+							"Emit WAL byte counters in neon_perf_counters",
+							NULL,
+							&neon_perf_counters_wal_extra,
+							true,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+							"neon.perf_counters_getpage_extra",
+							"Emit getpage request/wait counters in neon_perf_counters",
+							NULL,
+							&neon_perf_counters_getpage_extra,
+							true,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+							"neon.perf_counters_compute_resource",
+							"Emit compute CPU/memory cgroup metrics in neon_perf_counters",
+							"Fields are NULL when the cgroup v2 interface is unreadable (fail-honest).",
+							&neon_perf_counters_compute_resource,
+							true,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+
 	// A test hook used in sql regress to trigger specific behaviors
 	// to test features easily.
 	DefineCustomIntVariable(

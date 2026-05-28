@@ -150,3 +150,30 @@ CREATE VIEW neon_lfc_stats_per_relation AS
    AND s.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 GRANT SELECT ON neon_lfc_stats_per_relation TO pg_monitor;
+
+-- feat-015: widen neon_perf_counters with WAL / getpage / compute-resource
+-- metrics, assembled across modules into the same view.
+--
+-- The neon_perf_counters / neon_backend_perf_counters views are unchanged in
+-- SHAPE: they remain (metric text, bucket_le float8, value float8). The widening
+-- is delivered as additional metric ROWS emitted by the backing C function
+-- neon_get_perf_counters(), so no view DDL change is required and old clients
+-- selecting existing metric rows are unaffected (backward compatible).
+--
+-- New metric rows (all numeric; only _total / _sum / _count are exposed, no
+-- rate / mean / percentile -- those are left to the agent / history seam):
+--   WAL group     (neon.perf_counters_wal_extra):
+--     wal_write_bytes_total, wal_send_to_safekeeper_bytes_total
+--   getpage group (neon.perf_counters_getpage_extra):
+--     getpage_request_count_total, getpage_request_bytes_total,
+--     getpage_wait_us_total, getpage_wait_us_count
+--   compute group (neon.perf_counters_compute_resource), cgroup v2, NULL value
+--   on read failure (fail-honest):
+--     compute_cpu_user_share, compute_cpu_system_share, compute_memory_rss_bytes
+--     NOTE: *_share are the cumulative-lifetime fraction (%) of the cgroup's
+--     total CPU time spent in user / system mode (user_usec / usage_usec from
+--     cpu.stat), NOT a current or recent CPU utilization. A per-second rate is
+--     left to the agent / history seam.
+--
+-- Each group has its own GUC for independent rollback. This migration carries
+-- no DDL; it exists only to bump the extension to 1.7 alongside the C change.

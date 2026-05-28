@@ -600,6 +600,9 @@ WalproposerShmemInit(void)
 		pg_atomic_init_u64(&walprop_shared->mineLastElectedTerm, 0);
 		pg_atomic_init_u64(&walprop_shared->backpressureThrottlingTime, 0);
 		pg_atomic_init_u64(&walprop_shared->currentClusterSize, 0);
+		/* feat-015: cumulative WAL byte counters (atomics, see walproposer.h) */
+		pg_atomic_init_u64(&walprop_shared->wal_write_bytes_total, 0);
+		pg_atomic_init_u64(&walprop_shared->wal_send_to_safekeeper_bytes_total, 0);
 		/* BEGIN_HADRON */
 		pg_atomic_init_u32(&walprop_shared->wal_rate_limiter.effective_max_wal_bytes_per_second, -1);
 		pg_atomic_init_u32(&walprop_shared->wal_rate_limiter.should_limit, 0);
@@ -1627,6 +1630,25 @@ XLogBroadcastWalProposer(WalProposer *wp)
 	Assert(startptr <= endptr);
 	if (endptr <= startptr)
 		return;
+
+	/*
+	 * feat-015: count WAL produced/sent for neon_perf_counters. Single writer
+	 * (this walproposer process), but lock-free backend readers run on other
+	 * CPUs, so use the atomic fetch_add to publish the store with the right
+	 * memory ordering on weakly-ordered architectures. (endptr - startptr) is
+	 * the WAL delta we're about to broadcast to the safekeepers.
+	 */
+	{
+		struct WalproposerShmemState *wpstate = GetWalpropShmemState();
+
+		if (wpstate != NULL)
+		{
+			uint64		delta = (uint64) (endptr - startptr);
+
+			pg_atomic_fetch_add_u64(&wpstate->wal_write_bytes_total, delta);
+			pg_atomic_fetch_add_u64(&wpstate->wal_send_to_safekeeper_bytes_total, delta);
+		}
+	}
 
 	/* BEGIN_HADRON */
 	state = GetWalpropShmemState();

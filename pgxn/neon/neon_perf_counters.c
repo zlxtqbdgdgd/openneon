@@ -10,10 +10,12 @@
 #include "postgres.h"
 
 #include <math.h>
+#include <stdio.h>
 
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
+#include "storage/bufmgr.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
@@ -40,6 +42,82 @@ bool		neon_perf_counters_emit_buckets = true;
  * clients fall back to the aggregate lag from pg_stat_replication.
  */
 bool		neon_safekeeper_lsn_view_enabled = true;
+
+/*
+ * feat-015: per-group feature flags for the widened neon_perf_counters fields.
+ * Each group can be rolled back independently; when off, that group's metric
+ * rows are simply not emitted.
+ */
+bool		neon_perf_counters_wal_extra = true;
+bool		neon_perf_counters_getpage_extra = true;
+bool		neon_perf_counters_compute_resource = true;
+
+/*
+ * feat-015: read compute CPU%/RSS from the cgroup v2 interface.
+ *
+ * Fail-honest: on any error (cgroup v1, not containerized, file missing,
+ * parse failure) the corresponding out-param is left untouched and the caller
+ * emits NULL. We deliberately do NOT fabricate a 0 value.
+ *
+ * user_share / system_share are NOT a current/recent CPU utilization. They are
+ * the fraction (in percent) of all CPU time the cgroup has consumed SINCE ITS
+ * CREATION that went to user vs. system mode: user_usec / usage_usec and
+ * system_usec / usage_usec from cpu.stat (both cumulative-lifetime counters).
+ * cpu.stat exposes only cumulative usec, so a single read cannot yield an
+ * instantaneous percentage without a previous sample; we deliberately surface
+ * the cumulative split (named *_share, not *_pct, to avoid implying "current
+ * load"). A precise per-second rate is left to the agent/history seam
+ * (feat-064), consistent with the design's "view does not compute rate" rule.
+ */
+static bool
+read_cgroup_v2_memory_rss(int64 *rss_bytes)
+{
+	FILE	   *f = fopen("/sys/fs/cgroup/memory.current", "r");
+	long long	val;
+
+	if (f == NULL)
+		return false;
+	if (fscanf(f, "%lld", &val) != 1)
+	{
+		fclose(f);
+		return false;
+	}
+	fclose(f);
+	*rss_bytes = (int64) val;
+	return true;
+}
+
+static bool
+read_cgroup_v2_cpu_share(double *user_share, double *system_share)
+{
+	FILE	   *f = fopen("/sys/fs/cgroup/cpu.stat", "r");
+	char		key[64];
+	long long	val;
+	long long	usage_usec = -1;
+	long long	user_usec = -1;
+	long long	system_usec = -1;
+
+	if (f == NULL)
+		return false;
+
+	while (fscanf(f, "%63s %lld", key, &val) == 2)
+	{
+		if (strcmp(key, "usage_usec") == 0)
+			usage_usec = val;
+		else if (strcmp(key, "user_usec") == 0)
+			user_usec = val;
+		else if (strcmp(key, "system_usec") == 0)
+			system_usec = val;
+	}
+	fclose(f);
+
+	if (usage_usec <= 0 || user_usec < 0 || system_usec < 0)
+		return false;
+
+	*user_share = 100.0 * (double) user_usec / (double) usage_usec;
+	*system_share = 100.0 * (double) system_usec / (double) usage_usec;
+	return true;
+}
 
 /* BEGIN_HADRON */
 databricks_metrics *databricks_metrics_shared;
@@ -450,6 +528,127 @@ neon_get_perf_counters(PG_FUNCTION_ARGS)
 	{
 		metric_to_datums(&metrics[i], &values[0], &nulls[0]);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	/*
+	 * feat-015: widen neon_perf_counters with WAL / getpage / compute-resource
+	 * fields, assembled across modules into the same single view. Each group is
+	 * behind its own GUC; only _total / _sum / _count are exposed (no rate /
+	 * mean / percentile -- the agent / history seam computes those).
+	 */
+	{
+		WalproposerShmemState *wp_lsn_shmem = GetWalpropShmemState();
+
+		/* --- WAL group (source: walproposer shmem, single writer) --- */
+		if (neon_perf_counters_wal_extra && wp_lsn_shmem != NULL)
+		{
+			metric_t	m;
+
+			m.is_bucket = false;
+			m.bucket_le = 0;
+
+			m.name = "wal_write_bytes_total";
+			m.value = (double) pg_atomic_read_u64(&wp_lsn_shmem->wal_write_bytes_total);
+			metric_to_datums(&m, &values[0], &nulls[0]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+			m.name = "wal_send_to_safekeeper_bytes_total";
+			m.value = (double) pg_atomic_read_u64(&wp_lsn_shmem->wal_send_to_safekeeper_bytes_total);
+			metric_to_datums(&m, &values[0], &nulls[0]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
+
+		/* --- getpage group (source: existing aggregated backend counters) --- */
+		if (neon_perf_counters_getpage_extra)
+		{
+			metric_t	m;
+			uint64		req_count = totals.getpage_prefetch_requests_total +
+									totals.getpage_sync_requests_total;
+
+			m.is_bucket = false;
+			m.bucket_le = 0;
+
+			/* request count = prefetch + sync getpage requests */
+			m.name = "getpage_request_count_total";
+			m.value = (double) req_count;
+			metric_to_datums(&m, &values[0], &nulls[0]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+			/*
+			 * request bytes: every getpage returns exactly one BLCKSZ page, so
+			 * served-page bytes == request_count * BLCKSZ (exact identity, not
+			 * an estimate).
+			 */
+			m.name = "getpage_request_bytes_total";
+			m.value = (double) req_count * (double) BLCKSZ;
+			metric_to_datums(&m, &values[0], &nulls[0]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+			/* getpage wait: reuse the in-tree getpage histogram sum/count (us) */
+			m.name = "getpage_wait_us_total";
+			m.value = (double) totals.getpage_hist.wait_us_sum;
+			metric_to_datums(&m, &values[0], &nulls[0]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+			m.name = "getpage_wait_us_count";
+			m.value = (double) totals.getpage_hist.wait_us_count;
+			metric_to_datums(&m, &values[0], &nulls[0]);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
+
+		/* --- compute resource group (source: cgroup v2, fail-honest NULL) --- */
+		if (neon_perf_counters_compute_resource)
+		{
+			double		cpu_user_share = 0;
+			double		cpu_system_share = 0;
+			int64		rss_bytes = 0;
+			bool		cpu_ok = read_cgroup_v2_cpu_share(&cpu_user_share, &cpu_system_share);
+			bool		rss_ok = read_cgroup_v2_memory_rss(&rss_bytes);
+
+			/*
+			 * compute_cpu_user_share: cumulative-lifetime fraction (%) of the
+			 * cgroup's total CPU time spent in user mode, NOT a current/recent
+			 * utilization. See read_cgroup_v2_cpu_share().
+			 */
+			values[0] = CStringGetTextDatum("compute_cpu_user_share");
+			nulls[0] = false;
+			values[1] = (Datum) 0;
+			nulls[1] = true;		/* bucket_le */
+			if (cpu_ok)
+			{
+				values[2] = Float8GetDatum(cpu_user_share);
+				nulls[2] = false;
+			}
+			else
+				nulls[2] = true;
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+			/* compute_cpu_system_share: cumulative-lifetime system-mode share (%) */
+			values[0] = CStringGetTextDatum("compute_cpu_system_share");
+			nulls[0] = false;
+			nulls[1] = true;
+			if (cpu_ok)
+			{
+				values[2] = Float8GetDatum(cpu_system_share);
+				nulls[2] = false;
+			}
+			else
+				nulls[2] = true;
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+			/* compute_memory_rss_bytes */
+			values[0] = CStringGetTextDatum("compute_memory_rss_bytes");
+			nulls[0] = false;
+			nulls[1] = true;
+			if (rss_ok)
+			{
+				values[2] = Float8GetDatum((double) rss_bytes);
+				nulls[2] = false;
+			}
+			else
+				nulls[2] = true;
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
 	}
 
 	if (lakebase_mode) {
