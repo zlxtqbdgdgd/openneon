@@ -446,6 +446,10 @@ pub(crate) fn create_api() -> walproposer_api {
         reset_safekeeper_statuses_for_metrics: Some(reset_safekeeper_statuses_for_metrics),
         update_safekeeper_status_for_metrics: Some(update_safekeeper_status_for_metrics),
         /* END_HADRON */
+        // feat-035: simulator runs no real trace context source; emit no
+        // traceparent so SK side falls back to baseline (proto_version v3-style)
+        // tracing. Real Postgres backend lives in walproposer_pg.c.
+        get_outbound_traceparent: None,
     }
 }
 
