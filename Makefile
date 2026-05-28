@@ -24,6 +24,12 @@ ICU_PREFIX_DIR := /usr/local/icu
 #
 BUILD_TYPE ?= debug
 WITH_SANITIZERS ?= no
+# feat-067 · 启用 PostgreSQL USDT (User Statically Defined Tracepoints) ·
+# 30+ 个上游 probe (src/backend/utils/probes.d) 编进 binary · 探针未 attach
+# 时是 5-byte NOP < 1ns · attach 时由 feat-068 mcp tool 按白名单 (
+# pgxn/neon/probes/whitelist.yaml) 校验后下发 · 默认 yes 跟开 · 想关
+# (老 systemtap-sdt-dev 没装或交叉编译) 用 WITH_DTRACE=no
+WITH_DTRACE ?= yes
 PG_CFLAGS = -fsigned-char
 ifeq ($(BUILD_TYPE),release)
 	PG_CONFIGURE_OPTS = --enable-debug --with-openssl
@@ -52,6 +58,16 @@ ifeq ($(WITH_SANITIZERS),yes)
 	PG_LDFLAGS = -fsanitize=address -fsanitize=undefined -static-libasan -static-libubsan $(LDFLAGS)
 	export CC := gcc
 	export ASAN_OPTIONS := detect_leaks=0
+endif
+
+# feat-067 · 把 --enable-dtrace 拼到每种 BUILD_TYPE 的 PG_CONFIGURE_OPTS ·
+# 由 PG configure 触发 SystemTap SDT (Linux) / DTrace (macOS) probe header
+# 生成 · binary 里多出 NT_STAPSDT note section 含 30+ probe · 验证用
+# `readelf -n <postgres-binary> | grep stapsdt | wc -l` 应 >= 30 ·
+# 接受 WITH_DTRACE=no 把整套关掉,主要给老内核 / 没装 systemtap-sdt-dev
+# 的环境 fallback 用
+ifeq ($(WITH_DTRACE),yes)
+	PG_CONFIGURE_OPTS += --enable-dtrace
 endif
 
 ifeq ($(shell test -e /home/nonroot/.docker_build && echo -n yes),yes)

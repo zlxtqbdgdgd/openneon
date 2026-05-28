@@ -1,0 +1,5 @@
+# run_all.sh 跑出的 case 日志 · 不入库
+case-*/last.log
+case-*/build.log
+case-*/bpftrace.log
+case-*/pg.log
