@@ -174,6 +174,17 @@ pub fn write_postgres_conf(
         writeln!(file, "neon.endpoint_id={}", escape_conf_value(s))?;
     }
 
+    // feat-036 · PG jsonlog + Neon 字段注入 · 让 jsonlog 默认开 + GUC 默认全开 (endpoint_id/branch_id/project_id/trace_id)
+    //  - log_destination 加 'jsonlog' 让 PG 写 JSON 行 (PG 15+ native, vendor patch 添加了 Neon hook 点)
+    //  - neon.jsonlog_extra_fields 默认全开; 运维通过 ALTER SYSTEM SET 可临时关到空 (退化到上游 PG jsonlog)
+    //  - 实际写入与下方 logs_export_host 那段 stderr,syslog 路径互补 (jsonlog 给 OTel/agent · stderr 给 PG 风格 tooling)
+    writeln!(file, "# feat-036 · Neon jsonlog 字段注入")?;
+    writeln!(file, "neon.jsonlog_extra_fields='endpoint_id,branch_id,project_id,trace_id'")?;
+    // log_destination 加 'jsonlog' — feat-031 OTel exporter (compute_tools/src/logger.rs::init_tracing_and_logging) 
+    // 已经 wired 走 stdout/stderr;此处 *追加* jsonlog (PG 支持逗号分隔多个 destination), 让 stderr 路径不变.
+    // 若 logs_export_host 那段后面又写一遍 log_destination 会覆盖, 这里写在前面让 syslog 那段决定最终值.
+    writeln!(file, "log_destination='stderr,jsonlog'")?;
+
     // tls
     if let Some(tls_config) = tls_config {
         writeln!(file, "ssl = on")?;
