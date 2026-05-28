@@ -40,6 +40,46 @@ use crate::tenant::storage_layer::{InMemoryLayer, PersistentLayerDesc};
 use crate::tenant::tasks::BackgroundLoopKind;
 use crate::tenant::throttle::ThrottleResult;
 
+/// 注册一个带 USR 三件套 label 的 per-timeline metric vector（feat-008 §3.3(b)）。
+///
+/// 自动在调用方给定的 extra label **之后**追加 cornerstone canonical 的
+/// `["tenant_id", "shard_id", "timeline_id"]` 三件套（顺序跟 [`crate::usr::USR_METRIC_LABELS`]
+/// 一致），保证所有 per-timeline metric 的 USR label 齐全且命名不漂移。
+///
+/// 用法：
+/// ```ignore
+/// // 仅 USR 三件套
+/// let v = register_with_usr!(register_int_counter_vec, "name", "help");
+/// // USR 三件套 + 额外维度（额外维度排在三件套前面）
+/// let v = register_with_usr!(register_histogram_vec, "name", "help", &["operation"]);
+/// ```
+macro_rules! register_with_usr {
+    ($register:ident, $name:expr, $help:expr $(,)?) => {
+        $register!(
+            $name,
+            $help,
+            &[
+                $crate::usr::USR_METRIC_LABELS[0],
+                $crate::usr::USR_METRIC_LABELS[1],
+                $crate::usr::USR_METRIC_LABELS[2],
+            ],
+        )
+    };
+    ($register:ident, $name:expr, $help:expr, &[$($extra:expr),* $(,)?] $(,)?) => {
+        $register!(
+            $name,
+            $help,
+            &[
+                $($extra,)*
+                $crate::usr::USR_METRIC_LABELS[0],
+                $crate::usr::USR_METRIC_LABELS[1],
+                $crate::usr::USR_METRIC_LABELS[2],
+            ],
+        )
+    };
+}
+pub(crate) use register_with_usr;
+
 /// Prometheus histogram buckets (in seconds) for operations in the critical
 /// path. In other words, operations that directly affect that latency of user
 /// queries.

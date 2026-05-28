@@ -31,6 +31,8 @@ pub mod ip_address;
 
 pub mod shard;
 
+pub mod usr;
+
 mod hex;
 pub use hex::Hex;
 
