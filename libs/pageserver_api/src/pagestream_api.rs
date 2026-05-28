@@ -133,19 +133,179 @@ impl TryFrom<u8> for PagestreamBeMessageTag {
 // We copy fields from request to response to make checking more reliable: request ID is formed from process ID
 // and local counter, so in principle there can be duplicated requests IDs if process PID is reused.
 //
+// V4 version of protocol adds an OPTIONAL W3C TraceContext "traceparent" header in front of the
+// per-request fields. Wire layout (per pagestream message, only for V4):
+//
+//   tag(1) trace_present(1) [traceparent_wire(55)?] reqid(8) request_lsn(8) not_modified_since(8) <body>
+//
+// `trace_present` is 0x00 or 0x01:
+//   - 0x00: no trace context attached to this request (we still bump the version so that future
+//     bits in the prefix byte can carry additional propagation knobs without another version
+//     bump).
+//   - 0x01: the next 55 bytes hold a W3C TraceContext v00 traceparent wire string
+//     ("00-<32 hex>-<16 hex>-<2 hex>"). It is the canonical lowercase form, no NUL terminator.
+//
+// The companion C-side serializer/parser lives in `pgxn/neon/trace_context.{h,c}` (feat-033
+// anchor); both sides agree on the same 55-byte wire form (TRACE_CONTEXT_WIRE_LEN).
+//
+// Decision discipline: V4 is parse-only on the pageserver side. The pageserver MUST NOT
+// re-make sampling decisions; if a parent traceparent arrives we honor it (head-based
+// propagation, per ADR-0010 Q3). If trace_present=0 the pageserver does not invent a
+// trace_id; it just creates a local span as before.
+//
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PagestreamProtocolVersion {
     V2,
     V3,
+    /// V4 = V3 wire + optional W3C traceparent prefix (feat-033).
+    V4,
 }
 
 pub type RequestId = u64;
+
+/// On-the-wire byte length of a W3C TraceContext v00 "traceparent" header value.
+///
+/// Must stay in lock-step with `TRACE_CONTEXT_WIRE_LEN` in `pgxn/neon/trace_context.h`.
+/// Layout: `00-<32 hex trace_id>-<16 hex parent_id>-<2 hex flags>` = 2+1+32+1+16+1+2 = 55 bytes,
+/// no trailing NUL on the wire.
+pub const TRACE_CONTEXT_WIRE_LEN: usize = 55;
+
+/// W3C §3.2.2.5 "Trace Flags" defined bits, mirrored from
+/// `pgxn/neon/trace_context.h`. The byte is treated as an 8-bit bitmap; we only name the two
+/// bits the spec currently defines and forward the rest verbatim.
+pub const TRACE_CONTEXT_FLAG_SAMPLED: u8 = 0x01;
+pub const TRACE_CONTEXT_FLAG_RANDOM: u8 = 0x02;
+
+/// Decoded W3C TraceContext v00 "traceparent" value, in big-endian (network / hex) order so
+/// `memcmp` on the byte arrays matches lexicographic compare of the hex form. Mirrors the
+/// C-side `struct trace_context` from `pgxn/neon/trace_context.h`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct TraceContext {
+    /// Always 0x00 for v00. Parsers MUST forward-compat accept v>0 prefixes (W3C §3.2.2.3) but
+    /// when *we* emit, we always emit v00.
+    pub version: u8,
+    /// 128-bit trace_id, big-endian.
+    pub trace_id: [u8; 16],
+    /// 64-bit parent_id (a.k.a. span_id of the immediate sender), big-endian.
+    pub parent_id: [u8; 8],
+    /// W3C §3.2.2.5 trace_flags bitmap. As a *forwarder* preserve verbatim; as a *sender* only
+    /// set named bits (SAMPLED / RANDOM).
+    pub trace_flags: u8,
+}
+
+impl Default for TraceContext {
+    fn default() -> Self {
+        Self {
+            version: 0x00,
+            trace_id: [0u8; 16],
+            parent_id: [0u8; 8],
+            trace_flags: 0,
+        }
+    }
+}
+
+impl TraceContext {
+    /// Parse a 55-byte traceparent wire form. Lenient per W3C §3.2.2.3 forward-compat: accepts
+    /// any version byte in 0x00..=0xfe (only 0xff is reserved/invalid). Rejects all-zero
+    /// trace_id / parent_id and any non-hex / wrong-delimiter input.
+    pub fn parse_wire(input: &[u8]) -> anyhow::Result<Self> {
+        if input.len() < TRACE_CONTEXT_WIRE_LEN {
+            anyhow::bail!(
+                "traceparent wire too short: got {} bytes, need {}",
+                input.len(),
+                TRACE_CONTEXT_WIRE_LEN
+            );
+        }
+        let wire = &input[..TRACE_CONTEXT_WIRE_LEN];
+        if wire[2] != b'-' || wire[35] != b'-' || wire[52] != b'-' {
+            anyhow::bail!("traceparent wire: missing dash delimiters");
+        }
+        let version = decode_hex_byte(&wire[0..2])?;
+        if version == 0xff {
+            anyhow::bail!("traceparent wire: version 0xff is reserved/invalid");
+        }
+        let mut trace_id = [0u8; 16];
+        for (i, chunk) in wire[3..35].chunks(2).enumerate() {
+            trace_id[i] = decode_hex_byte(chunk)?;
+        }
+        if trace_id == [0u8; 16] {
+            anyhow::bail!("traceparent wire: trace_id must not be all zero");
+        }
+        let mut parent_id = [0u8; 8];
+        for (i, chunk) in wire[36..52].chunks(2).enumerate() {
+            parent_id[i] = decode_hex_byte(chunk)?;
+        }
+        if parent_id == [0u8; 8] {
+            anyhow::bail!("traceparent wire: parent_id must not be all zero");
+        }
+        let trace_flags = decode_hex_byte(&wire[53..55])?;
+        Ok(Self {
+            version,
+            trace_id,
+            parent_id,
+            trace_flags,
+        })
+    }
+
+    /// Serialize as 55 bytes (lowercase hex, no NUL terminator). We only emit version 0x00 per
+    /// ADR-0010; trying to serialize a TraceContext with a non-zero version is a programming
+    /// error and panics in debug, returns 55 garbage-version bytes in release (we never
+    /// construct such values in tree).
+    pub fn serialize_wire(&self, out: &mut [u8]) {
+        assert!(out.len() >= TRACE_CONTEXT_WIRE_LEN);
+        debug_assert_eq!(self.version, 0x00, "we only emit traceparent v00");
+        write_hex_byte(&mut out[0..2], 0x00);
+        out[2] = b'-';
+        for (i, b) in self.trace_id.iter().enumerate() {
+            write_hex_byte(&mut out[3 + i * 2..3 + i * 2 + 2], *b);
+        }
+        out[35] = b'-';
+        for (i, b) in self.parent_id.iter().enumerate() {
+            write_hex_byte(&mut out[36 + i * 2..36 + i * 2 + 2], *b);
+        }
+        out[52] = b'-';
+        write_hex_byte(&mut out[53..55], self.trace_flags);
+    }
+
+    /// True iff the W3C SAMPLED bit (0x01) is set. Pageserver uses this when deciding whether
+    /// to attach OTel-exportable fields to the local span (the actual export decision lives in
+    /// the tracing-opentelemetry bridge configured by feat-031).
+    pub fn is_sampled(&self) -> bool {
+        self.trace_flags & TRACE_CONTEXT_FLAG_SAMPLED != 0
+    }
+}
+
+#[inline]
+fn decode_hex_byte(b: &[u8]) -> anyhow::Result<u8> {
+    debug_assert_eq!(b.len(), 2);
+    fn nibble(c: u8) -> anyhow::Result<u8> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            other => anyhow::bail!("traceparent wire: invalid hex char 0x{other:02x}"),
+        }
+    }
+    Ok((nibble(b[0])? << 4) | nibble(b[1])?)
+}
+
+#[inline]
+fn write_hex_byte(out: &mut [u8], b: u8) {
+    debug_assert_eq!(out.len(), 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out[0] = HEX[(b >> 4) as usize];
+    out[1] = HEX[(b & 0x0f) as usize];
+}
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub struct PagestreamRequest {
     pub reqid: RequestId,
     pub request_lsn: Lsn,
     pub not_modified_since: Lsn,
+    /// W3C TraceContext propagated from the compute / libpq client side (feat-033 / issue #21).
+    /// Only meaningful on V4 wire. On V2/V3 wire it stays `None` because there's no place for
+    /// it on the wire; on V4 it can also be `None` if the sender chose not to attach one.
+    pub trace_context: Option<TraceContext>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -231,17 +391,64 @@ pub struct PagestreamTestResponse {
 }
 
 impl PagestreamFeMessage {
-    /// Serialize a compute -> pageserver message. This is currently only used in testing
-    /// tools. Always uses protocol version 3.
-    pub fn serialize(&self) -> Bytes {
+    /// Serialize a compute -> pageserver message at the given protocol version.
+    ///
+    /// This is currently only used by tests and in-tree mock-pageserver tooling; production
+    /// computes write the wire form directly from C (see `pgxn/neon/communicator.c`
+    /// `nm_pack_request`). Keep the two sides byte-for-byte identical when extending.
+    ///
+    /// V4 wire prefix (only when `protocol_version == V4`):
+    ///   tag(1) trace_present(1) [traceparent_wire(55)?] reqid(8) request_lsn(8) nlm_since(8)
+    /// V3 wire (V3): tag(1) reqid(8) request_lsn(8) nlm_since(8)
+    /// V2 wire (V2): tag(1) request_lsn(8) nlm_since(8)
+    pub fn serialize(&self, protocol_version: PagestreamProtocolVersion) -> Bytes {
         let mut bytes = BytesMut::new();
+
+        // Helper: write the leading [tag, trace_prefix?, reqid, request_lsn, not_modified_since]
+        // section that's shared across all variants.
+        fn put_header(
+            bytes: &mut BytesMut,
+            tag: PagestreamFeMessageTag,
+            hdr: &PagestreamRequest,
+            protocol_version: PagestreamProtocolVersion,
+        ) {
+            bytes.put_u8(tag as u8);
+            if matches!(protocol_version, PagestreamProtocolVersion::V4) {
+                match hdr.trace_context {
+                    Some(tc) => {
+                        bytes.put_u8(1u8);
+                        let mut wire = [0u8; TRACE_CONTEXT_WIRE_LEN];
+                        tc.serialize_wire(&mut wire);
+                        bytes.put_slice(&wire);
+                    }
+                    None => {
+                        bytes.put_u8(0u8);
+                    }
+                }
+            }
+            match protocol_version {
+                PagestreamProtocolVersion::V2 => {
+                    // V2 had no reqid; senders that try to round-trip V2 with this serializer
+                    // simply lose the reqid (legacy).
+                    bytes.put_u64(hdr.request_lsn.0);
+                    bytes.put_u64(hdr.not_modified_since.0);
+                }
+                PagestreamProtocolVersion::V3 | PagestreamProtocolVersion::V4 => {
+                    bytes.put_u64(hdr.reqid);
+                    bytes.put_u64(hdr.request_lsn.0);
+                    bytes.put_u64(hdr.not_modified_since.0);
+                }
+            }
+        }
 
         match self {
             Self::Exists(req) => {
-                bytes.put_u8(PagestreamFeMessageTag::Exists as u8);
-                bytes.put_u64(req.hdr.reqid);
-                bytes.put_u64(req.hdr.request_lsn.0);
-                bytes.put_u64(req.hdr.not_modified_since.0);
+                put_header(
+                    &mut bytes,
+                    PagestreamFeMessageTag::Exists,
+                    &req.hdr,
+                    protocol_version,
+                );
                 bytes.put_u32(req.rel.spcnode);
                 bytes.put_u32(req.rel.dbnode);
                 bytes.put_u32(req.rel.relnode);
@@ -249,10 +456,12 @@ impl PagestreamFeMessage {
             }
 
             Self::Nblocks(req) => {
-                bytes.put_u8(PagestreamFeMessageTag::Nblocks as u8);
-                bytes.put_u64(req.hdr.reqid);
-                bytes.put_u64(req.hdr.request_lsn.0);
-                bytes.put_u64(req.hdr.not_modified_since.0);
+                put_header(
+                    &mut bytes,
+                    PagestreamFeMessageTag::Nblocks,
+                    &req.hdr,
+                    protocol_version,
+                );
                 bytes.put_u32(req.rel.spcnode);
                 bytes.put_u32(req.rel.dbnode);
                 bytes.put_u32(req.rel.relnode);
@@ -260,10 +469,12 @@ impl PagestreamFeMessage {
             }
 
             Self::GetPage(req) => {
-                bytes.put_u8(PagestreamFeMessageTag::GetPage as u8);
-                bytes.put_u64(req.hdr.reqid);
-                bytes.put_u64(req.hdr.request_lsn.0);
-                bytes.put_u64(req.hdr.not_modified_since.0);
+                put_header(
+                    &mut bytes,
+                    PagestreamFeMessageTag::GetPage,
+                    &req.hdr,
+                    protocol_version,
+                );
                 bytes.put_u32(req.rel.spcnode);
                 bytes.put_u32(req.rel.dbnode);
                 bytes.put_u32(req.rel.relnode);
@@ -272,27 +483,33 @@ impl PagestreamFeMessage {
             }
 
             Self::DbSize(req) => {
-                bytes.put_u8(PagestreamFeMessageTag::DbSize as u8);
-                bytes.put_u64(req.hdr.reqid);
-                bytes.put_u64(req.hdr.request_lsn.0);
-                bytes.put_u64(req.hdr.not_modified_since.0);
+                put_header(
+                    &mut bytes,
+                    PagestreamFeMessageTag::DbSize,
+                    &req.hdr,
+                    protocol_version,
+                );
                 bytes.put_u32(req.dbnode);
             }
 
             Self::GetSlruSegment(req) => {
-                bytes.put_u8(PagestreamFeMessageTag::GetSlruSegment as u8);
-                bytes.put_u64(req.hdr.reqid);
-                bytes.put_u64(req.hdr.request_lsn.0);
-                bytes.put_u64(req.hdr.not_modified_since.0);
+                put_header(
+                    &mut bytes,
+                    PagestreamFeMessageTag::GetSlruSegment,
+                    &req.hdr,
+                    protocol_version,
+                );
                 bytes.put_u8(req.kind);
                 bytes.put_u32(req.segno);
             }
             #[cfg(feature = "testing")]
             Self::Test(req) => {
-                bytes.put_u8(PagestreamFeMessageTag::Test as u8);
-                bytes.put_u64(req.hdr.reqid);
-                bytes.put_u64(req.hdr.request_lsn.0);
-                bytes.put_u64(req.hdr.not_modified_since.0);
+                put_header(
+                    &mut bytes,
+                    PagestreamFeMessageTag::Test,
+                    &req.hdr,
+                    protocol_version,
+                );
                 bytes.put_u64(req.batch_key);
                 let message = req.message.as_bytes();
                 bytes.put_u64(message.len() as u64);
@@ -312,13 +529,31 @@ impl PagestreamFeMessage {
         // TODO: consider using protobuf or serde bincode for less error prone
         // serialization.
         let msg_tag = body.read_u8()?;
+        // V4 trace prefix sits between the tag byte and the header LSNs. We read it eagerly so
+        // that downstream variants don't need to know it exists.
+        let trace_context = if matches!(protocol_version, PagestreamProtocolVersion::V4) {
+            let trace_present = body.read_u8()?;
+            match trace_present {
+                0 => None,
+                1 => {
+                    let mut wire = [0u8; TRACE_CONTEXT_WIRE_LEN];
+                    body.read_exact(&mut wire)?;
+                    Some(TraceContext::parse_wire(&wire)?)
+                }
+                other => anyhow::bail!(
+                    "pagestream V4: invalid trace_present byte 0x{other:02x} (expected 0 or 1)"
+                ),
+            }
+        } else {
+            None
+        };
         let (reqid, request_lsn, not_modified_since) = match protocol_version {
             PagestreamProtocolVersion::V2 => (
                 0,
                 Lsn::from(body.read_u64::<BigEndian>()?),
                 Lsn::from(body.read_u64::<BigEndian>()?),
             ),
-            PagestreamProtocolVersion::V3 => (
+            PagestreamProtocolVersion::V3 | PagestreamProtocolVersion::V4 => (
                 body.read_u64::<BigEndian>()?,
                 Lsn::from(body.read_u64::<BigEndian>()?),
                 Lsn::from(body.read_u64::<BigEndian>()?),
@@ -334,6 +569,7 @@ impl PagestreamFeMessage {
                         reqid,
                         request_lsn,
                         not_modified_since,
+                        trace_context,
                     },
                     rel: RelTag {
                         spcnode: body.read_u32::<BigEndian>()?,
@@ -349,6 +585,7 @@ impl PagestreamFeMessage {
                         reqid,
                         request_lsn,
                         not_modified_since,
+                        trace_context,
                     },
                     rel: RelTag {
                         spcnode: body.read_u32::<BigEndian>()?,
@@ -364,6 +601,7 @@ impl PagestreamFeMessage {
                         reqid,
                         request_lsn,
                         not_modified_since,
+                        trace_context,
                     },
                     rel: RelTag {
                         spcnode: body.read_u32::<BigEndian>()?,
@@ -380,6 +618,7 @@ impl PagestreamFeMessage {
                         reqid,
                         request_lsn,
                         not_modified_since,
+                        trace_context,
                     },
                     dbnode: body.read_u32::<BigEndian>()?,
                 }))
@@ -390,6 +629,7 @@ impl PagestreamFeMessage {
                         reqid,
                         request_lsn,
                         not_modified_since,
+                        trace_context,
                     },
                     kind: body.read_u8()?,
                     segno: body.read_u32::<BigEndian>()?,
@@ -401,6 +641,7 @@ impl PagestreamFeMessage {
                     reqid,
                     request_lsn,
                     not_modified_since,
+                    trace_context,
                 },
                 batch_key: body.read_u64::<BigEndian>()?,
                 message: {
@@ -463,7 +704,12 @@ impl PagestreamBeMessage {
                     }
                 }
             }
-            PagestreamProtocolVersion::V3 => {
+            // V4 BE responses currently mirror V3 wire byte-for-byte. The pageserver -> compute
+            // direction does NOT need to carry the W3C traceparent back: the compute already
+            // knows which trace it is in, and the response is just data. We keep the arm
+            // separate so that any future "echo trace_id in response for debugging" extension
+            // can hang off V4 without disturbing V3 behaviour.
+            PagestreamProtocolVersion::V3 | PagestreamProtocolVersion::V4 => {
                 match self {
                     Self::Exists(resp) => {
                         bytes.put_u8(Tag::Exists as u8);
@@ -571,6 +817,7 @@ impl PagestreamBeMessage {
                                 reqid,
                                 request_lsn,
                                 not_modified_since,
+                                trace_context: None,
                             },
                             rel,
                         },
@@ -594,6 +841,7 @@ impl PagestreamBeMessage {
                                 reqid,
                                 request_lsn,
                                 not_modified_since,
+                                trace_context: None,
                             },
                             rel,
                         },
@@ -619,6 +867,7 @@ impl PagestreamBeMessage {
                                 reqid,
                                 request_lsn,
                                 not_modified_since,
+                                trace_context: None,
                             },
                             rel,
                             blkno,
@@ -639,6 +888,7 @@ impl PagestreamBeMessage {
                             reqid,
                             request_lsn,
                             not_modified_since,
+                            trace_context: None,
                         },
                         message: rust_str.to_owned(),
                     })
@@ -655,6 +905,7 @@ impl PagestreamBeMessage {
                                 reqid,
                                 request_lsn,
                                 not_modified_since,
+                                trace_context: None,
                             },
                             dbnode,
                         },
@@ -676,6 +927,7 @@ impl PagestreamBeMessage {
                                 reqid,
                                 request_lsn,
                                 not_modified_since,
+                                trace_context: None,
                             },
                             kind,
                             segno,
@@ -699,6 +951,7 @@ impl PagestreamBeMessage {
                                 reqid,
                                 request_lsn,
                                 not_modified_since,
+                                trace_context: None,
                             },
                             batch_key,
                             message,
@@ -734,15 +987,27 @@ impl PagestreamBeMessage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_pagestream() {
-        // Test serialization/deserialization of PagestreamFeMessage
-        let messages = vec![
+    fn sample_traceparent() -> TraceContext {
+        // Canonical W3C example (https://www.w3.org/TR/trace-context/#examples-of-traceparent).
+        TraceContext {
+            version: 0x00,
+            trace_id: [
+                0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+                0x47, 0x36,
+            ],
+            parent_id: [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7],
+            trace_flags: TRACE_CONTEXT_FLAG_SAMPLED,
+        }
+    }
+
+    fn sample_messages_without_trace() -> Vec<PagestreamFeMessage> {
+        vec![
             PagestreamFeMessage::Exists(PagestreamExistsRequest {
                 hdr: PagestreamRequest {
                     reqid: 0,
                     request_lsn: Lsn(4),
                     not_modified_since: Lsn(3),
+                    trace_context: None,
                 },
                 rel: RelTag {
                     forknum: 1,
@@ -756,6 +1021,7 @@ mod tests {
                     reqid: 0,
                     request_lsn: Lsn(4),
                     not_modified_since: Lsn(4),
+                    trace_context: None,
                 },
                 rel: RelTag {
                     forknum: 1,
@@ -769,6 +1035,7 @@ mod tests {
                     reqid: 0,
                     request_lsn: Lsn(4),
                     not_modified_since: Lsn(3),
+                    trace_context: None,
                 },
                 rel: RelTag {
                     forknum: 1,
@@ -783,16 +1050,175 @@ mod tests {
                     reqid: 0,
                     request_lsn: Lsn(4),
                     not_modified_since: Lsn(3),
+                    trace_context: None,
                 },
                 dbnode: 7,
             }),
-        ];
+        ]
+    }
+
+    #[test]
+    fn test_pagestream_v3_round_trip() {
+        // Legacy V3 round-trip: must remain byte-compatible with neon main.
+        let messages = sample_messages_without_trace();
         for msg in messages {
-            let bytes = msg.serialize();
+            let bytes = msg.serialize(PagestreamProtocolVersion::V3);
             let reconstructed =
                 PagestreamFeMessage::parse(&mut bytes.reader(), PagestreamProtocolVersion::V3)
                     .unwrap();
             assert!(msg == reconstructed);
+        }
+    }
+
+    #[test]
+    fn test_pagestream_v4_round_trip_with_traceparent() {
+        // V4 carries a TraceContext; fixture verifies parse/serialize symmetry per W3C wire form.
+        let tc = sample_traceparent();
+        let messages: Vec<PagestreamFeMessage> = sample_messages_without_trace()
+            .into_iter()
+            .map(|msg| {
+                let mut msg = msg;
+                match &mut msg {
+                    PagestreamFeMessage::Exists(r) => {
+                        r.hdr.reqid = 17;
+                        r.hdr.trace_context = Some(tc);
+                    }
+                    PagestreamFeMessage::Nblocks(r) => {
+                        r.hdr.reqid = 18;
+                        r.hdr.trace_context = Some(tc);
+                    }
+                    PagestreamFeMessage::GetPage(r) => {
+                        r.hdr.reqid = 19;
+                        r.hdr.trace_context = Some(tc);
+                    }
+                    PagestreamFeMessage::DbSize(r) => {
+                        r.hdr.reqid = 20;
+                        r.hdr.trace_context = Some(tc);
+                    }
+                    _ => {}
+                }
+                msg
+            })
+            .collect();
+
+        for msg in messages {
+            let bytes = msg.serialize(PagestreamProtocolVersion::V4);
+            let reconstructed =
+                PagestreamFeMessage::parse(&mut bytes.reader(), PagestreamProtocolVersion::V4)
+                    .unwrap();
+            assert_eq!(msg, reconstructed);
+        }
+    }
+
+    #[test]
+    fn test_pagestream_v4_round_trip_without_traceparent() {
+        // V4 sender that chose not to attach a parent traceparent (e.g. local-only request);
+        // wire still bumps protocol_version so the receiver knows to consume 1 byte for the
+        // trace_present flag.
+        for msg in sample_messages_without_trace() {
+            let bytes = msg.serialize(PagestreamProtocolVersion::V4);
+            let reconstructed =
+                PagestreamFeMessage::parse(&mut bytes.reader(), PagestreamProtocolVersion::V4)
+                    .unwrap();
+            assert_eq!(msg, reconstructed);
+        }
+    }
+
+    #[test]
+    fn test_pagestream_v3_and_v4_wire_diverge() {
+        // Same logical message serialized as V3 vs V4 must produce different bytes: V4 inserts
+        // 1 trace_present byte right after the tag. This guards against an accidental
+        // PagestreamProtocolVersion::V4 arm that silently emits V3 bytes.
+        let msg = sample_messages_without_trace().remove(0);
+        let v3 = msg.serialize(PagestreamProtocolVersion::V3);
+        let v4 = msg.serialize(PagestreamProtocolVersion::V4);
+        assert_eq!(v4.len(), v3.len() + 1);
+        assert_eq!(v4[0], v3[0]); // same tag
+        assert_eq!(v4[1], 0); // trace_present=0
+        assert_eq!(&v4[2..], &v3[1..]); // rest matches
+    }
+
+    #[test]
+    fn test_pagestream_v4_attached_trace_adds_55_bytes() {
+        // Symmetric guard for the attached-trace case: V4 + Some(tc) must be exactly 56 bytes
+        // longer than V3 (1 prefix flag + 55 wire bytes).
+        let tc = sample_traceparent();
+        let mut msg = sample_messages_without_trace().remove(2); // GetPage
+        if let PagestreamFeMessage::GetPage(r) = &mut msg {
+            r.hdr.trace_context = Some(tc);
+        }
+        let v3 = msg.serialize(PagestreamProtocolVersion::V3);
+        let v4 = msg.serialize(PagestreamProtocolVersion::V4);
+        assert_eq!(v4.len(), v3.len() + 1 + TRACE_CONTEXT_WIRE_LEN);
+        assert_eq!(v4[1], 1); // trace_present=1
+        // Verify the wire is canonical lowercase W3C.
+        let wire = std::str::from_utf8(&v4[2..2 + TRACE_CONTEXT_WIRE_LEN]).unwrap();
+        assert_eq!(
+            wire,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn test_trace_context_parse_invalid() {
+        // Forwarder discipline: bad wires must surface as parse errors so we can't silently
+        // attach garbage to a server-side span. Five negative cases.
+
+        // length: too short
+        assert!(TraceContext::parse_wire(b"00-too-short").is_err());
+
+        // delimiters: wrong dash position
+        let mut bad = b"00-4bf92f3577b34da6a3ce929d0e0e4736X00f067aa0ba902b7-01".to_vec();
+        bad[35] = b'X';
+        assert!(TraceContext::parse_wire(&bad).is_err());
+
+        // non-hex char in trace_id
+        let bad = b"00-zz92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        assert!(TraceContext::parse_wire(bad).is_err());
+
+        // all-zero trace_id
+        let bad = b"00-00000000000000000000000000000000-00f067aa0ba902b7-01";
+        assert!(TraceContext::parse_wire(bad).is_err());
+
+        // all-zero parent_id
+        let bad = b"00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01";
+        assert!(TraceContext::parse_wire(bad).is_err());
+    }
+
+    #[test]
+    fn test_trace_context_serialize_round_trip() {
+        let tc = sample_traceparent();
+        let mut buf = [0u8; TRACE_CONTEXT_WIRE_LEN];
+        tc.serialize_wire(&mut buf);
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        let back = TraceContext::parse_wire(&buf).unwrap();
+        assert_eq!(back, tc);
+        assert!(back.is_sampled());
+    }
+
+    #[test]
+    fn test_pagestream_v4_negotiation_downgrade_simulated() {
+        // Simulated mixed-version negotiation: a V4 client cannot reach a V3 pageserver
+        // because the wire framing differs; tools that proxy / mock must explicitly downgrade.
+        // This test pins behaviour by trying to parse a V4 wire as V3 and asserting it does NOT
+        // accidentally succeed with garbage. The first byte after the tag in V4 is a 0/1
+        // trace_present flag; under V3 it would be interpreted as the high byte of reqid.
+        let mut msg = sample_messages_without_trace().remove(0);
+        if let PagestreamFeMessage::Exists(r) = &mut msg {
+            r.hdr.reqid = 0; // so the V3 misparse can't accidentally match
+            r.hdr.trace_context = Some(sample_traceparent());
+        }
+        let v4_wire = msg.serialize(PagestreamProtocolVersion::V4);
+        // Parsing V4 bytes under V3 will misalign the relfile/forknum tail and almost certainly
+        // fail (short read or bogus tag in a follow-up message). We only assert it does not
+        // round-trip to the same message — that's the real downgrade contract.
+        if let Ok(decoded) =
+            PagestreamFeMessage::parse(&mut v4_wire.reader(), PagestreamProtocolVersion::V3)
+        {
+            assert_ne!(decoded, msg, "V3 must not silently decode V4 wire correctly");
         }
     }
 }

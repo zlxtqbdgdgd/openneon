@@ -19,9 +19,19 @@
 #include "lib/stringinfo.h"
 #include "storage/block.h"
 #include "storage/buf_internals.h"
+#include "trace_context.h"		/* feat-033: W3C TraceContext (traceparent) */
 
 #define MAX_SHARDS 128
 #define MAX_PAGESERVER_CONNSTRING_SIZE 256
+
+/*
+ * Pagestore wire protocol version this build understands. Bumped from 3 to 4 for feat-033
+ * (W3C TraceContext propagation). See pgxn/neon/libpagestore.c for the runtime negotiation
+ * + downgrade logic and libs/pageserver_api/src/pagestream_api.rs for the matching Rust
+ * parser. Keep in sync with `pub enum PagestreamProtocolVersion`.
+ */
+#define NEON_PROTOCOL_VERSION_LATEST 4
+#define NEON_PROTOCOL_VERSION_MIN 2
 
 typedef enum
 {
@@ -54,6 +64,22 @@ typedef struct
 	NeonRequestId reqid;
 	XLogRecPtr	lsn;
 	XLogRecPtr	not_modified_since;
+
+	/*
+	 * feat-033 (issue #21/#22): optional W3C TraceContext propagated to the pageserver.
+	 *
+	 * Only serialized on wire when neon_protocol_version >= 4 (see libpagestore.c +
+	 * nm_pack_request in communicator.c). When `has_trace_context` is false on a V4 wire
+	 * we still emit the `trace_present` flag byte (0x00) so the receiver can skip past it.
+	 * On V3 / V2 wire these two fields are simply ignored — there's no place for them on
+	 * the wire and the V3 server has no way to parse them.
+	 *
+	 * The struct is owned by the request, NOT by some thread-local current span; callers
+	 * must fill it from whatever current-trace source they have (e.g. a future feat-033
+	 * follow-up that hooks into PgBackendStatus.trace_id, or an in-flight sampler).
+	 */
+	bool		has_trace_context;
+	struct trace_context trace_context;
 } NeonMessage;
 
 #define messageTag(m) (((const NeonMessage *)(m))->tag)
@@ -173,7 +199,7 @@ typedef struct
 } NeonGetSlruSegmentResponse;
 
 
-extern StringInfoData nm_pack_request(NeonRequest *msg);
+extern StringInfoData nm_pack_request(NeonRequest *msg, int protocol_version);
 extern NeonResponse *nm_unpack_response(StringInfo s);
 extern char *nm_to_string(NeonMessage *msg);
 
