@@ -14,7 +14,7 @@
  *	  https://google.github.io/sqlcommenter/spec/
  *
  * Format summary (W3C TraceContext + sqlcommenter):
- *	  SELECT ... / *traceparent='00-{32hex}-{16hex}-{2hex}',tracestate='neon=root=proxy',action='checkout'* /
+ *	  SELECT ... / *traceparent='00-{32hex}-{16hex}-{2hex}',tracestate='neon=proxy',action='checkout'* /
  *	  (spaces around the slash-star delimiters are only for the
  *	  surrounding C comment; the wire format has no spaces there.)
  *
@@ -86,7 +86,7 @@ extern bool sqlcommenter_extract_traceparent(const char *sql,
  * Output shape (no leading whitespace inside the comment, single quotes
  * around values per spec, lowercase hex per W3C §3.2.2):
  *	  <sql> / *traceparent='00-{32hex}-{16hex}-{2hex}'* /
- *	  <sql> / *traceparent='00-...',tracestate='neon=root=proxy'* /
+ *	  <sql> / *traceparent='00-...',tracestate='neon=proxy'* /
  *	  (spaces around the slash-star delimiters are only for this
  *	  surrounding C comment; the wire output is contiguous.)
  *

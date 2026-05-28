@@ -98,7 +98,7 @@ test_multi_kv(void)
 
 	EXPECT(ok, "extract: multi-KV traceparent picked up");
 	EXPECT(tp_matches_reference(&tc), "extract: multi-KV decoded correctly");
-	EXPECT(ts != NULL && strcmp(ts, "neon=root=proxy") == 0,
+	EXPECT(ts != NULL && strcmp(ts, "neon=proxy") == 0,
 		   "extract: tracestate URL-decoded");
 	free(ts);
 }
@@ -253,7 +253,7 @@ test_inject_round_trip(void)
 	free(injected);
 }
 
-/* ---------------- Inject: with tracestate (path β: neon=root=proxy) - */
+/* ---------------- Inject: with tracestate (path β: neon=proxy) - */
 static void
 test_inject_with_tracestate(void)
 {
@@ -267,7 +267,7 @@ test_inject_with_tracestate(void)
 
 	char	   *injected = sqlcommenter_inject_traceparent(
 		"START_WAL_PUSH (proto_version '3', allow_timeline_creation 'true')",
-		&tc, "neon=root=proxy");
+		&tc, "neon=proxy");
 
 	EXPECT(injected != NULL, "inject: with tracestate non-NULL");
 	/*
@@ -286,7 +286,7 @@ test_inject_with_tracestate(void)
 	bool		ok = sqlcommenter_extract_traceparent(injected, &tc2, &ts);
 
 	EXPECT(ok, "inject: tracestate round-trip extract succeeds");
-	EXPECT(ts != NULL && strcmp(ts, "neon=root=proxy") == 0,
+	EXPECT(ts != NULL && strcmp(ts, "neon=proxy") == 0,
 		   "inject: tracestate decoded back to original");
 	free(ts);
 	free(injected);
