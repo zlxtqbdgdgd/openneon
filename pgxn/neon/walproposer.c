@@ -43,6 +43,12 @@
 #include "walproposer.h"
 #include "neon_utils.h"
 
+/* feat-034 path β: SQLCommenter injection into walproposer SQL. */
+#ifndef WALPROPOSER_LIB
+#include "sqlcommenter.h"
+#include "neon_trace_status.h"
+#endif
+
 /* Prototypes for private functions */
 static void WalProposerLoop(WalProposer *wp);
 static void ShutdownConnection(Safekeeper *sk);
@@ -651,6 +657,17 @@ HandleConnectionEvent(Safekeeper *sk)
  * Send "START_WAL_PUSH" message as an empty query to the safekeeper. Performs
  * a blocking send, then immediately moves to SS_WAIT_EXEC_RESULT. If something
  * goes wrong, change state to SS_OFFLINE and shutdown the connection.
+ *
+ * feat-034 path β: if this walproposer process currently holds a
+ * trace_context (set via post_parse_analyze_hook from the upstream
+ * client query that triggered the WAL flush, OR by proxy entry at the
+ * very start of the connection), we URL-encode it as a SQLCommenter
+ * `traceparent='...'` block and append it to `cmd`. The safekeeper /
+ * pageserver then sees `tracestate='neon=root=proxy'` (or whatever the
+ * upstream set) so it can attribute its OpenTelemetry spans to the
+ * same trace_id. This is the Neon-internal cross-process trace handoff
+ * that Datadog DBM cannot do (they only see client→DB; they never get
+ * to modify the DB internals to forward IDs further).
  */
 static void
 SendStartWALPush(Safekeeper *sk)
@@ -661,16 +678,49 @@ SendStartWALPush(Safekeeper *sk)
 	char	   *allow_timeline_creation = WalProposerGenerationsEnabled(wp) ? "false" : "true";
 #define CMD_LEN 512
 	char		cmd[CMD_LEN];
-
+	const char *cmd_to_send;
+#ifndef WALPROPOSER_LIB
+	char	   *cmd_with_trace = NULL;
+	struct trace_context tc;
+	char		tracestate[NEON_TRACESTATE_MAX];
+#endif
 
 	snprintf(cmd, CMD_LEN, "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s')", wp->config->proto_version, allow_timeline_creation);
-	if (!wp->api.conn_send_query(sk, cmd))
+	cmd_to_send = cmd;
+
+#ifndef WALPROPOSER_LIB
+	/*
+	 * Path β: pick up the current trace_context (if any) and rewrite
+	 * the cmd buffer so the receiving safekeeper / pageserver can pull
+	 * trace_id off the same SQL it already parses. Silent no-op when
+	 * no trace is in flight (e.g. background walproposer activity
+	 * without a triggering client query).
+	 */
+	if (neon_trace_status_current(&tc, tracestate, sizeof(tracestate)))
+	{
+		const char *ts_arg = (tracestate[0] != '\0') ? tracestate : "neon=root=proxy";
+
+		cmd_with_trace = sqlcommenter_inject_traceparent(cmd, &tc, ts_arg);
+		if (cmd_with_trace != NULL)
+			cmd_to_send = cmd_with_trace;
+	}
+#endif
+
+	if (!wp->api.conn_send_query(sk, (char *) cmd_to_send))
 	{
 		wp_log(WARNING, "failed to send '%s' query to safekeeper %s:%s: %s",
-			   cmd, sk->host, sk->port, wp->api.conn_error_message(sk));
+			   cmd_to_send, sk->host, sk->port, wp->api.conn_error_message(sk));
+#ifndef WALPROPOSER_LIB
+		if (cmd_with_trace != NULL)
+			free(cmd_with_trace);
+#endif
 		ShutdownConnection(sk);
 		return;
 	}
+#ifndef WALPROPOSER_LIB
+	if (cmd_with_trace != NULL)
+		free(cmd_with_trace);
+#endif
 	sk->state = SS_WAIT_EXEC_RESULT;
 	wp->api.update_event_set(sk, WL_SOCKET_READABLE);
 }
