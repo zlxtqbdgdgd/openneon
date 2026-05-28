@@ -230,6 +230,17 @@ usdt:
       - "const char *tranche"
       - "LWLockMode mode"
 
+  - target: postgresql
+    probe_name: "postgresql:lwlock__condacquire"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+    notes: "LWLockConditionalAcquire 成功命中 · 探测乐观锁路径 · 来源 PG 14+ probes.d 标准 USDT · R2 元评补漏 (issue#54 comment 4564616746)"
+
   # ============================================================
   # 5. deadlock 检测
   # ============================================================
