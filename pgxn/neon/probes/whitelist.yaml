@@ -166,7 +166,7 @@ usdt:
       - "LocalTransactionId txid"
 
   # ============================================================
-  # 4. lock / lwlock (6 个 · 锁等待最常诊断)
+  # 4. lock / lwlock (9 个 · 锁等待最常诊断 · 含 condacquire + acquire_or_wait 同族 #62 补漏)
   # ============================================================
   - target: postgresql
     probe_name: "postgresql:lock__wait__start"
@@ -240,6 +240,40 @@ usdt:
       - "const char *tranche"
       - "LWLockMode mode"
     notes: "LWLockConditionalAcquire 成功命中 · 探测乐观锁路径 · 来源 PG 14+ probes.d 标准 USDT · R2 元评补漏 (issue#54 comment 4564616746)"
+
+  # follow-up #62: lwlock 同族 3 条补漏 (PR47 body 已声明留 follow-up)
+  - target: postgresql
+    probe_name: "postgresql:lwlock__condacquire__fail"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+    notes: "LWLockConditionalAcquire 失败 · 探测乐观锁未命中路径 · 来源 PG 14+ probes.d 标准 USDT · follow-up #62 (issue#54 comment 4564616746 lwlock 同族补漏)"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__acquire__or__wait"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+    notes: "LWLockAcquireOrWait 成功命中 (拿到或加入等待队列) · 探测共享缓冲池抢占 + WAL 缓冲并发场景 · 来源 PG 14+ probes.d 标准 USDT · follow-up #62"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__acquire__or__wait__fail"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+    notes: "LWLockAcquireOrWait 失败 · 探测乐观抢占失败路径 · 来源 PG 14+ probes.d 标准 USDT · follow-up #62"
 
   # ============================================================
   # 5. deadlock 检测
