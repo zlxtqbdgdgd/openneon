@@ -19,6 +19,7 @@ OBJS = \
 	neon_walreader.o \
 	pagestore_smgr.o \
 	relsize_cache.o \
+	trace_context.o \
 	unstable_extensions.o \
 	walproposer.o \
 	walproposer_pg.o \
@@ -59,7 +60,8 @@ DATA = \
 PGFILEDESC = "neon - cloud storage for PostgreSQL"
 
 EXTRA_CLEAN = \
-	libwalproposer.a
+	libwalproposer.a \
+	test/trace_context_test
 
 WALPROP_OBJS = \
 	$(WIN32RES) \
@@ -102,3 +104,31 @@ pgindent:
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# ---------------------------------------------------------------------------
+# Standalone unit tests for trace_context.{h,c}
+#
+# trace_context 是 W3C TraceContext (traceparent v00) 的 serializer/parser,
+# 零外部依赖 (不 #include postgres.h)。可以脱离 PGXS / pg_install 直接用
+# 系统 gcc 编出来跑单测。后续 feat-033 / 034 / 035 / 065 在 libpq /
+# libpagestore / proxy 各自 wire-up 时 #include "trace_context.h" 复用。
+#
+# 用法:
+#	make -f Makefile check-trace-context
+#
+# 也接入 PGXS installcheck (走系统 gcc, 不依赖 pg_config):
+#	make installcheck   # 不变, 走 PGXS 默认
+#
+# CI / 开发机推荐显式跑 check-trace-context。
+# ---------------------------------------------------------------------------
+
+TRACE_CONTEXT_CC ?= cc
+TRACE_CONTEXT_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -O0 -g
+
+test/trace_context_test: trace_context.c trace_context.h test/test_trace_context.c
+	$(TRACE_CONTEXT_CC) $(TRACE_CONTEXT_CFLAGS) -I. \
+		trace_context.c test/test_trace_context.c -o $@
+
+.PHONY: check-trace-context
+check-trace-context: test/trace_context_test
+	./test/trace_context_test
