@@ -114,6 +114,8 @@ twox-hash.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true
+# feat-069-binary-wire (D4) · USDT provider 接入 · Linux only · macOS dev 不引入 dtrace 依赖
+neon_probes = { path = "../pgxn/neon/probes/rust" }
 
 [dev-dependencies]
 base64.workspace = true

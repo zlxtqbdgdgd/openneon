@@ -76,6 +76,17 @@
 // List of temporarily allowed lints to unblock beta/nightly.
 #![allow(unknown_lints)]
 
+// feat-069-binary-wire (D4) · USDT provider 接入
+// 让 neon_probes crate 的 stapsdt note section 进入 proxy binary ELF · Linux only
+#[cfg(target_os = "linux")]
+pub use neon_probes;
+#[cfg(target_os = "linux")]
+#[used]
+static _FORCE_LINK_NEON_PROBES: fn() = || {
+    neon_probes::proxy::auth__start("_link_anchor");
+};
+
+
 pub mod binary;
 
 mod auth;

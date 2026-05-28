@@ -1,5 +1,16 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+// feat-069-binary-wire (D4) · USDT provider 接入
+// 让 neon_probes crate 的 stapsdt note section 进入 safekeeper binary ELF · Linux only
+#[cfg(target_os = "linux")]
+pub use neon_probes;
+#[cfg(target_os = "linux")]
+#[used]
+static _FORCE_LINK_NEON_PROBES: fn() = || {
+    neon_probes::safekeeper::wal_append__start(0, 0);
+};
+
+
 extern crate hyper0 as hyper;
 
 use std::time::Duration;

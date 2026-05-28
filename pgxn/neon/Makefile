@@ -135,3 +135,16 @@ check-probes:
 .PHONY: check-feat069
 check-feat069:
 	bash $(srcdir)/probes/tests/feat069_fixtures.sh
+
+# ---------------------------------------------------------------------------
+# feat-069-binary-wire (D4) · 3 binary stapsdt note 接入验证
+#
+# 用法 (Linux 物理机 · 需先 cargo build --release -p pageserver -p safekeeper -p proxy):
+#     make -C pgxn/neon check-feat069-wire
+#
+# 通过判据: 各 binary readelf -n | grep NT_STAPSDT 数 >= A5 #48 lib.rs USDT 段定义数
+# ---------------------------------------------------------------------------
+
+.PHONY: check-feat069-wire
+check-feat069-wire:
+	bash $(srcdir)/probes/tests/feat069_binary_wire_check.sh

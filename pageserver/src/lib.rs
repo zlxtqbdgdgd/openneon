@@ -1,6 +1,19 @@
 #![recursion_limit = "300"]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+// feat-069-binary-wire (D4) · USDT provider 接入
+// 让 neon_probes crate 的 stapsdt note section 进入 pageserver binary ELF ·
+// Linux only · macOS / Windows dev 路径不引入 dtrace toolchain 依赖。
+//  静态引用确保 linker 不 dead-code-strip 整个 rlib。
+#[cfg(target_os = "linux")]
+pub use neon_probes;
+#[cfg(target_os = "linux")]
+#[used]
+static _FORCE_LINK_NEON_PROBES: fn() = || {
+    neon_probes::pageserver::get_page_at_lsn__start("_link_anchor", "_link_anchor", 0);
+};
+
+
 mod auth;
 pub mod basebackup;
 pub mod basebackup_cache;
