@@ -54,6 +54,7 @@ tokio-rustls.workspace = true
 tokio-tar.workspace = true
 tokio-util = { workspace = true }
 tracing.workspace = true
+tracing-utils.workspace = true
 url.workspace = true
 metrics.workspace = true
 pem.workspace = true
