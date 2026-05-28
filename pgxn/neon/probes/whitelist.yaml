@@ -1,0 +1,582 @@
+# feat-067 · PostgreSQL 上游 USDT 白名单 (实际部署) · 30+ probe ·
+# 字段约定见 ./whitelist.schema.json · 跟 feat-069 Rust uprobe 共享一份 schema ·
+# 由 feat-068 mcp tool 加载 · denylist 优先级高于 whitelist (任一命中即拒)
+#
+# probe 来源:
+#   - vendor/postgres-v14/src/backend/utils/probes.d  (PG 14+ 标准 dtrace probe)
+#   - vendor/postgres-v17/src/backend/utils/probes.d  (PG 17 等价 · 没新增)
+#
+# 命名规范:
+#   - dtrace .d 文件里 probe 名段用单 dash '-' 分隔 (例 query-start)
+#   - readelf -n 看到 NT_STAPSDT note · probe 名段会自动转双下划线
+#     '__' (例 query__start) · provider 字段固定为 "postgresql"
+#   - 本文件 probe_name 字段统一用 provider:probe__name 格式 ·
+#     跟 feat-068 attach 时 bpftrace 接收的 `usdt:postgres:postgresql:probe__name`
+#     里的最后一段完全一致 · 避免 mcp tool 二次转码
+#
+# PG 版本覆盖:
+#   - pg_version_min: 14 (Neon fork 最低支持版本 · vendor/postgres-v14)
+#   - pg_version_max: null (开放上界 · vendor 同时支持 v14/v15/v16/v17)
+#   - 个别 probe 在 PG 14 之前用旧名 (例 xlog-insert -> wal-insert · PG 14 重命名)
+#     · 这里只列 PG 14+ 真实名,旧名 N/A
+#
+# overhead 估算 ns:
+#   - 数字是 PG mailing list 历史经验值 / 官方文档参考 · attach 后实际 overhead
+#     视内核 / CPU / probe 频率而定 · 真实 overhead 由 feat-068 attach 后用
+#     pgbench 现场测得 · 这里只给数量级
+#   - 通用规律: 非命中函数 0 ns (NOP) · 命中后 SystemTap SDT 进入内核 BPF VM
+#     单次开销 30-200 ns
+#
+# subsystem 分类参考 schema 23 enum (见 README.md)
+
+version: 1
+
+usdt:
+  # ============================================================
+  # 1. query 编译流水线 (parser / rewriter / planner / executor)
+  #    PG 上游标准 12 个 probe · 覆盖 SQL 从 parse 到 execute 全流程
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:query__start"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "char *query_string"
+    notes: "PG query 入口 · 进 exec_simple_query / exec_execute_message · hot path 但命中频率跟 QPS 同阶 · attach 前先采样"
+
+  - target: postgresql
+    probe_name: "postgresql:query__done"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "char *query_string"
+    notes: "PG query 出口 · 跟 query__start 配对算 query latency"
+
+  - target: postgresql
+    probe_name: "postgresql:query__parse__start"
+    subsystem: parser
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "const char *query_string"
+
+  - target: postgresql
+    probe_name: "postgresql:query__parse__done"
+    subsystem: parser
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "const char *query_string"
+
+  - target: postgresql
+    probe_name: "postgresql:query__rewrite__start"
+    subsystem: rewriter
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "const char *query_string"
+
+  - target: postgresql
+    probe_name: "postgresql:query__rewrite__done"
+    subsystem: rewriter
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "const char *query_string"
+
+  - target: postgresql
+    probe_name: "postgresql:query__plan__start"
+    subsystem: planner
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+
+  - target: postgresql
+    probe_name: "postgresql:query__plan__done"
+    subsystem: planner
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+
+  - target: postgresql
+    probe_name: "postgresql:query__execute__start"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+    notes: "hot path · 命中频率跟 statement 数同阶 · feat-068 attach 前必须先在 staging 验 overhead < 5%"
+
+  - target: postgresql
+    probe_name: "postgresql:query__execute__done"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+    notes: "hot path · 跟 query__execute__start 配对算 executor 阶段耗时"
+
+  # ============================================================
+  # 2. statement 状态机
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:statement__status"
+    subsystem: statement
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 30
+    args:
+      - "const char *status"
+    notes: "PgStat 报 pg_stat_activity.state 时触发 · 低频"
+
+  # ============================================================
+  # 3. transaction 边界 (3 个)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:transaction__start"
+    subsystem: transaction
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "LocalTransactionId txid"
+
+  - target: postgresql
+    probe_name: "postgresql:transaction__commit"
+    subsystem: transaction
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "LocalTransactionId txid"
+
+  - target: postgresql
+    probe_name: "postgresql:transaction__abort"
+    subsystem: transaction
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 40
+    args:
+      - "LocalTransactionId txid"
+
+  # ============================================================
+  # 4. lock / lwlock (6 个 · 锁等待最常诊断)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:lock__wait__start"
+    subsystem: lock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "LOCKTAG *locktag"
+      - "LOCKMODE lockmode"
+    notes: "heavyweight lock 等待入口 · 高低频均可命中 · 排查锁冲突首选"
+
+  - target: postgresql
+    probe_name: "postgresql:lock__wait__done"
+    subsystem: lock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "LOCKTAG *locktag"
+      - "LOCKMODE lockmode"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__acquire"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+    notes: "hot path · LWLock 在 buffer/wal/clog 都密集用 · attach 整全表会显著拖慢 · 建议按 tranche 过滤"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__release"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+    args:
+      - "const char *tranche"
+    notes: "hot path · 同 lwlock__acquire"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__wait__start"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+
+  - target: postgresql
+    probe_name: "postgresql:lwlock__wait__done"
+    subsystem: lwlock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "const char *tranche"
+      - "LWLockMode mode"
+
+  # ============================================================
+  # 5. deadlock 检测
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:deadlock__found"
+    subsystem: lock
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    notes: "罕见 · 命中即说明 backend 卡死锁 · 适合 critical alert"
+
+  # ============================================================
+  # 6. smgr 媒介 IO (4 个 · 磁盘 read/write 边界)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:smgr__md__read__start"
+    subsystem: smgr
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+      - "Oid spcOid"
+      - "Oid dbOid"
+      - "Oid relNumber"
+      - "int backendId"
+    notes: "md (magnetic disk) backend 真正读盘前触发 · Neon 自己改造 storage 后命中频率显著低于上游"
+
+  - target: postgresql
+    probe_name: "postgresql:smgr__md__read__done"
+    subsystem: smgr
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+      - "Oid spcOid"
+
+  - target: postgresql
+    probe_name: "postgresql:smgr__md__write__start"
+    subsystem: smgr
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+
+  - target: postgresql
+    probe_name: "postgresql:smgr__md__write__done"
+    subsystem: smgr
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+
+  # ============================================================
+  # 7. WAL 写入 (PG 14+ 用 wal-* · 之前 xlog-* 旧名 N/A)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:wal__insert"
+    subsystem: wal
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+    args:
+      - "uint8 info"
+      - "uint8 rmid"
+    notes: "WAL record 写到 wal buffer · 高频 · 等价 PG 13 之前 xlog__insert"
+
+  - target: postgresql
+    probe_name: "postgresql:wal__switch"
+    subsystem: wal
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 70
+    notes: "WAL segment 切到新 16MB 段 · 周期性 · 等价 PG 13 之前 xlog__switch"
+
+  - target: postgresql
+    probe_name: "postgresql:wal__buffer__write__dirty__start"
+    subsystem: wal
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+    notes: "buffer cache 把 dirty WAL buffer 刷到 OS · attach 排查 WAL 刷盘瓶颈"
+
+  - target: postgresql
+    probe_name: "postgresql:wal__buffer__write__dirty__done"
+    subsystem: wal
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 100
+
+  # ============================================================
+  # 8. checkpoint 流程 (CLOG / multixact / subtrans / twophase · 5 + 4*2 = 13 个)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:checkpoint__start"
+    subsystem: checkpoint
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "int flags"
+    notes: "周期性 + CHECKPOINT 显式触发 · 低频但关键 · attach 排查 checkpoint 卡顿"
+
+  - target: postgresql
+    probe_name: "postgresql:checkpoint__done"
+    subsystem: checkpoint
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "int buf_written"
+      - "int buf_sync"
+      - "int buf_xlog"
+
+  - target: postgresql
+    probe_name: "postgresql:clog__checkpoint__start"
+    subsystem: clog
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool shutdown"
+
+  - target: postgresql
+    probe_name: "postgresql:clog__checkpoint__done"
+    subsystem: clog
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool shutdown"
+
+  - target: postgresql
+    probe_name: "postgresql:multixact__checkpoint__start"
+    subsystem: clog
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool shutdown"
+    notes: "multi-transaction ID 检查点 · 跟 clog 同 subsystem 归类 · 没专门 enum"
+
+  - target: postgresql
+    probe_name: "postgresql:multixact__checkpoint__done"
+    subsystem: clog
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool shutdown"
+
+  - target: postgresql
+    probe_name: "postgresql:subtrans__checkpoint__start"
+    subsystem: clog
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool shutdown"
+    notes: "subtransaction 检查点 · 跟 clog 共用 enum"
+
+  - target: postgresql
+    probe_name: "postgresql:subtrans__checkpoint__done"
+    subsystem: clog
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool shutdown"
+
+  - target: postgresql
+    probe_name: "postgresql:twophase__checkpoint__start"
+    subsystem: checkpoint
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+
+  - target: postgresql
+    probe_name: "postgresql:twophase__checkpoint__done"
+    subsystem: checkpoint
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+
+  # ============================================================
+  # 9. buffer cache (5 个 · checkpoint / sync / write-dirty)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:buffer__read__start"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+      - "Oid spcOid"
+    notes: "hot path · shared buffer cache miss 才走到 smgr · 命中此 probe 频率约等于查询数据访问次数"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__read__done"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+      - "Oid spcOid"
+      - "Oid dbOid"
+      - "Oid relNumber"
+      - "int backendId"
+      - "bool isExtend"
+      - "bool found"
+    notes: "hot path · 配对算 buffer 读耗时"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__flush__start"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__flush__done"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__checkpoint__start"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+    args:
+      - "int flags"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__checkpoint__sync__start"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__checkpoint__done"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__sync__start"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+    args:
+      - "int num_buffers"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__sync__written"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__sync__done"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 60
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__write__dirty__start"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+    args:
+      - "ForkNumber forknum"
+      - "BlockNumber blocknum"
+
+  - target: postgresql
+    probe_name: "postgresql:buffer__write__dirty__done"
+    subsystem: buffer
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 80
+
+  # ============================================================
+  # 10. sort 排序 (2 个 · 内存/外排切换观测)
+  # ============================================================
+  - target: postgresql
+    probe_name: "postgresql:sort__start"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "int heap_tuples"
+      - "int index_tuples"
+      - "int nKeys"
+      - "int workMem"
+      - "bool randomAccess"
+
+  - target: postgresql
+    probe_name: "postgresql:sort__done"
+    subsystem: executor
+    pg_version_min: 14
+    pg_version_max: null
+    sample_overhead_ns_estimate: 50
+    args:
+      - "bool external"
+      - "long memUsage"
+
+denylist:
+  # ============================================================
+  # PG 侧 deny pattern (issue#31 验收门指定 7 类) ·
+  # regex 在 feat-068 mcp tool 运行时用 re.fullmatch 匹配
+  # 因为 deny 是按 probe 名 (provider 段后那段) 匹配 · 不带前缀
+  # ============================================================
+  usdt_probe_patterns:
+    # 1. MD5 hash · pg_md5_hash / pg_md5_binary / pg_md5_hash_compat 等
+    - "^pg_md5_hash.*"
+    # 2. SCRAM authentication · scram_init / scram_exchange 等
+    - "^scram_.*"
+    # 3. TLS handshake · be_tls_init / be_tls_open_server / be_tls_close
+    - "^be_tls_.*"
+    # 4. GSSAPI · be_gssapi_read / be_gssapi_write 等
+    - "^be_gssapi_.*"
+    # 5. 数据库账号密码处理函数
+    - "^get_role_password$"
+    # 6. token 校验
+    - "^verify_token$"
+    # 7. password hash 校验
+    - "^check_password_hash$"
