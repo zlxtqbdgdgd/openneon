@@ -51,6 +51,7 @@
 #include "neon.h"
 #include "neon_perf_counters.h"
 #include "neon_walreader.h"
+#include "trace_context.h"
 #include "walproposer.h"
 
 #define XLOG_HDR_SIZE (1 + 8 * 3)	/* 'w' + startPos + walEnd + timestamp */
@@ -2345,6 +2346,91 @@ walprop_pg_update_safekeeper_lsns_for_metrics(WalProposer *wp, uint32 sk_index,
 	SpinLockRelease(&shmem->mutex);
 }
 
+/*
+ * feat-035 段 1 (compute → SK) 出口: 给 walproposer.c::SendStartWALPush 提供
+ * traceparent / tracestate 值。
+ *
+ * 来源契约 (issue #27, design §3.3 段 1):
+ *   trace_id 应取自 `PgBackendStatus.trace_context` (feat-033/#3 + feat-034/#2
+ *   共享)。本仓 anchor branch 没有这个字段, 所以本实现暂走 *self-generate root*
+ *   路径: 调用 trace_context_serialize 写一个随机 trace_id, 并在 tracestate 打
+ *   `neon=walproposer` 标记 (W3C TraceState §3.3 single-token form, design#54 ADR),
+ *   让下游 (SK / pageserver) 知道这一链路根来自 compute walproposer 自己。
+ *
+ * 当 feat-033/#3 merge 进 main 后 (跟踪 openneon#58), 应该把这里改成:
+ *   if (MyBEEntry != NULL && trace_context_is_valid(&MyBEEntry->trace_context))
+ *       return trace_context_serialize(&MyBEEntry->trace_context, buf, buflen);
+ * 即"有上游就承接, 没上游就 fallback 自生 root"——TODO(feat-033/#3 wiring)。
+ *
+ * 返回 1 成功 (buf 已填 55-byte traceparent), 0 跳过 (不发 KV)。
+ */
+static int
+walprop_pg_get_outbound_traceparent(WalProposer *wp,
+									char *buf, size_t buflen,
+									char *tracestate_buf,
+									size_t tracestate_buflen,
+									size_t *tracestate_len_out)
+{
+	struct trace_context tc;
+	int			n;
+	const char *root_marker = "neon=walproposer";
+	size_t		marker_len;
+
+	if (buf == NULL || buflen < TRACE_CONTEXT_BUF_SIZE)
+		return 0;
+
+	/*
+	 * Self-generate root. Random bytes via walproposer api callback to keep
+	 * mock/sim test paths in control of entropy source.
+	 */
+	tc.version = 0x00;
+	if (!wp->api.strong_random(wp, tc.trace_id, sizeof(tc.trace_id)))
+		return 0;
+	if (!wp->api.strong_random(wp, tc.parent_id, sizeof(tc.parent_id)))
+		return 0;
+	/* Guard against the 1-in-2^128 / 1-in-2^64 all-zero corner. */
+	{
+		size_t		i;
+		bool		all_zero = true;
+
+		for (i = 0; i < sizeof(tc.trace_id); i++)
+			if (tc.trace_id[i] != 0) { all_zero = false; break; }
+		if (all_zero) tc.trace_id[0] = 0x01;
+		all_zero = true;
+		for (i = 0; i < sizeof(tc.parent_id); i++)
+			if (tc.parent_id[i] != 0) { all_zero = false; break; }
+		if (all_zero) tc.parent_id[0] = 0x01;
+	}
+	tc.trace_flags = TRACE_CONTEXT_FLAG_SAMPLED | TRACE_CONTEXT_FLAG_RANDOM;
+
+	n = trace_context_serialize(&tc, buf, buflen);
+	if (n != TRACE_CONTEXT_WIRE_LEN)
+		return 0;
+
+	/* Emit tracestate root marker only if caller provided a buffer. */
+	if (tracestate_buf != NULL && tracestate_buflen > 0)
+	{
+		marker_len = strlen(root_marker);
+		if (marker_len + 1 <= tracestate_buflen)
+		{
+			memcpy(tracestate_buf, root_marker, marker_len);
+			tracestate_buf[marker_len] = '\0';
+			if (tracestate_len_out != NULL)
+				*tracestate_len_out = marker_len;
+		}
+		else if (tracestate_len_out != NULL)
+		{
+			*tracestate_len_out = 0;
+		}
+	}
+	else if (tracestate_len_out != NULL)
+	{
+		*tracestate_len_out = 0;
+	}
+
+	return 1;
+}
+
 static const walproposer_api walprop_pg = {
 	.get_shmem_state = walprop_pg_get_shmem_state,
 	.start_streaming = walprop_pg_start_streaming,
@@ -2380,4 +2466,5 @@ static const walproposer_api walprop_pg = {
 	.reset_safekeeper_statuses_for_metrics = walprop_pg_reset_safekeeper_statuses_for_metrics,
 	.update_safekeeper_status_for_metrics = walprop_pg_update_safekeeper_status_for_metrics,
 	.update_safekeeper_lsns_for_metrics = walprop_pg_update_safekeeper_lsns_for_metrics,
+	.get_outbound_traceparent = walprop_pg_get_outbound_traceparent,
 };
