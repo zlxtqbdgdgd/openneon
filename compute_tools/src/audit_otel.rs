@@ -115,7 +115,7 @@ fn is_audit_log_file(path: &Path) -> bool {
 /// 读一行 · 长度封顶 MAX_LINE_BYTES(防御超长行)。返回消耗的字节数(含换行符)。
 fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut String) -> Result<usize> {
     let mut buf = Vec::new();
-    let n = reader.take(MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf)?;
+    let n = std::io::Read::take(&mut *reader, MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf)?;
     // lossy: audit log 理论上 UTF-8 · 异常字节不丢整行
     out.push_str(&String::from_utf8_lossy(&buf));
     Ok(n)
