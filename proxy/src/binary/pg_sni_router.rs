@@ -32,6 +32,7 @@ use crate::pqproto::FeStartupPacket;
 use crate::protocol2::ConnectionInfo;
 use crate::proxy::{ErrorSource, copy_bidirectional_client_compute};
 use crate::stream::{PqStream, Stream};
+use crate::trace_context::{self, TraceContext, TraceRoot};
 use crate::util::run_until_cancelled;
 
 project_git_version!(GIT_VERSION);
@@ -317,6 +318,12 @@ async fn handle_client(
         .1
         .server_name()
         .ok_or(anyhow!("SNI missing"))?;
+
+    // feat-065/#30: pg_sni_router 不解 startup packet，看不到上游 traceparent。
+    // 强制 path β 自生 trace_id；同时挂一个 OTel SpanLink 标记 "SNI fallthrough"
+    // —— 表达 trace 链路在 SNI 后断重建的语义。未来如果 PROXY protocol v2 TLV 或
+    // TLS ALPN 扩展能提供上游 SpanContext，把 fallthrough_link 换成真实 SpanContext 即可。
+    attach_sni_router_trace_context(&ctx, sni);
     let dest: Vec<&str> = sni
         .split_once('.')
         .context("invalid SNI")?
@@ -379,4 +386,53 @@ async fn handle_client(
 enum Connection {
     Raw(tokio::net::TcpStream),
     Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+}
+
+/// feat-065/#30: pg_sni_router 的 trace context 处理。
+///
+/// 因为 sni_router 永远不解 startup packet，无法读到上游 `-c neon.traceparent=...`。
+/// 实现策略：
+///
+/// 1. **强制 path β**：用 connect_request span 自己分配的 trace_id 当作本次连接的 root。
+/// 2. **OTel SpanLink fallthrough 标记**：往 connect_request span 上 `add_link` 一个 synthetic
+///    SpanContext（trace_id=0, span_id=0，attribute 标 `feat065.sni_fallthrough=true` +
+///    `feat065.sni=<hostname>`），表达「trace 在 SNI 后断重建」的语义；下游 compute
+///    自己开新 trace，上下两段通过 SpanLink + 同 sni 字段在分析侧拼回。
+///
+/// 跟 path α 真正"链接上游 trace"的不同：path α 用 `set_parent` 让 trace_id 透传；
+/// SNI fallthrough 是不同 trace_id 间的弱关联，因此用 link 而不是 parent。
+fn attach_sni_router_trace_context(ctx: &RequestContext, sni: &str) {
+    use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
+    use opentelemetry::KeyValue;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    // Step 1: path β —— 自生 trace_id（从 connect_request span 抽出来）。
+    if let Some(self_tc) = trace_context::from_current_span() {
+        ctx.set_trace_context(TraceContext {
+            span_context: self_tc.span_context.clone(),
+            root: TraceRoot::Proxy,
+        });
+    }
+
+    // Step 2: 挂 SpanLink 占位（synthetic SpanContext + 标记 attribute）。
+    // 这里用 INVALID SpanContext（trace_id/span_id 全 0），通过 attribute 表达 "SNI fallthrough"。
+    // 注意 SDK 实现差异：有些 sampler 会丢弃 INVALID link；我们 attribute 上额外加 sni
+    // 字符串作为后备，确保任何后端都能拼回。
+    let synthetic = SpanContext::new(
+        TraceId::INVALID,
+        SpanId::INVALID,
+        TraceFlags::default(),
+        false,
+        TraceState::default(),
+    );
+    let attrs = vec![
+        KeyValue::new("feat065.sni_fallthrough", true),
+        KeyValue::new("feat065.sni", sni.to_string()),
+        KeyValue::new("feat065.path", "β"),
+    ];
+    tracing::Span::current().add_link_with_attributes(synthetic, attrs);
+
+    // 同时把 sni 写到 span 自身的字段上方便检索
+    let _ = TraceContextExt::span(&tracing::Span::current().context());
+    tracing::info!(feat065.sni = sni, "pg_sni_router span established (fallthrough)");
 }
