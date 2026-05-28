@@ -50,6 +50,73 @@ macro_rules! critical_timeline {
     }};
 }
 
+/// feat-031 · audit log OTel export 的 tracing target。
+///
+/// 所有 audit-relevant 事件用 `tracing::info!(target: AUDIT_TARGET, ...)` emit ·
+/// 让 OTel collector 端按 `target=openneon::audit` 把 audit 事件跟 ordinary trace 分流路由
+/// (详 [feat-031 §3.3](https://github.com/zlxtqbdgdgd/openneon-design/blob/main/features/feat-031-L2-neon-audit-log-otel-export.html))。
+/// 跟 mcp 侧 (zlxtqbdgdgd/openneon-mcp#110 `emitAuditEvent`) `target` 属性统一。
+pub const AUDIT_TARGET: &str = "openneon::audit";
+
+/// feat-031 · audit event taxonomy (`openneon.audit.event_type` 取值)。
+///
+/// 13 类 · 跟 feat-031 §3.2 (a) attribute schema strict 对齐 · 跨 mcp/neon 统一。
+/// neon 内核侧 L2a 主要 emit `DDL_EXECUTED` (pageserver) + `COMPUTE_AUDIT_LOG_RECORD`
+/// (compute_tools);其余 (plan_mode_* / confirm_token_* / g*_deny / claim_override 等)
+/// 由 mcp Server 侧 emit。
+pub mod audit_event_type {
+    pub const G1_CROSS_PROJECT_DENY: &str = "g1_cross_project_deny";
+    pub const G4_DESTRUCTIVE_DENY: &str = "g4_destructive_deny";
+    pub const G9_RATE_LIMIT_DENY: &str = "g9_rate_limit_deny";
+    pub const PLAN_MODE_REQUIRED: &str = "plan_mode_required";
+    pub const PLAN_MODE_APPROVED: &str = "plan_mode_approved";
+    pub const PLAN_MODE_REJECTED: &str = "plan_mode_rejected";
+    pub const CONFIRM_TOKEN_ISSUED: &str = "confirm_token_issued";
+    pub const CONFIRM_TOKEN_VERIFIED: &str = "confirm_token_verified";
+    pub const CONFIRM_TOKEN_REJECTED: &str = "confirm_token_rejected";
+    pub const CLAIM_OVERRIDE: &str = "claim_override";
+    pub const DESTRUCTIVE_CLASSIFIED: &str = "destructive_classified";
+    pub const DDL_EXECUTED: &str = "ddl_executed";
+    pub const COMPUTE_AUDIT_LOG_RECORD: &str = "compute_audit_log_record";
+}
+
+/// feat-031 · emit 一条 audit event 到 `openneon::audit` tracing target。
+///
+/// expands 到 `tracing::info!(target: "openneon::audit", event_type, ...)` —— OtelGuard
+/// 自动把它当 span export 到 OTLP collector,collector 端按 `target` 路由 audit-vs-trace
+/// (详 [feat-031 §3.2 (b) + §3.3](https://github.com/zlxtqbdgdgd/openneon-design/blob/main/features/feat-031-L2-neon-audit-log-otel-export.html))。
+///
+/// attribute 命名空间 `openneon.audit.*` (`event_type` / `op_class` / `principal` / `outcome`
+/// 为必填语义字段 · DB 字段 `db.system` / `db.statement.sha256`) · 跟 mcp 侧统一。
+///
+/// **PII redact (§6)**:`db.statement` 永不传全文 · 只传 `db.statement.sha256`。
+/// **USR (feat-008-011 L2b)**:`openneon.usr.*` namespace 已留 hook · L2a emit 时不填
+/// (缺失不算 fail · L2b ship 后 4 组件 tracing event 自动 propagate · 不 breaking)。
+///
+/// # 用法
+/// ```ignore
+/// // 必填四件套 + 可选 attribute (tracing key-value 语法 · dot key 用字符串字面量包裹)
+/// audit_event!(
+///     event_type = utils::logging::audit_event_type::DDL_EXECUTED,
+///     op_class = "CREATE_INDEX_CONCURRENTLY",
+///     principal = "agent:ab12",
+///     outcome = "allow",
+///     "db.system" = "postgresql",
+/// );
+/// // 也支持带 message 尾参
+/// audit_event!(event_type = "ddl_executed", outcome = "allow", "ddl 执行完成");
+/// ```
+#[macro_export]
+macro_rules! audit_event {
+    // 仅 key-value 字段 (无尾随 message)
+    ($($fields:tt)+) => {{
+        tracing::info!(
+            target: $crate::logging::AUDIT_TARGET,
+            $($fields)+
+        );
+    }};
+}
+
 #[derive(EnumString, strum_macros::Display, VariantNames, Eq, PartialEq, Debug, Clone, Copy)]
 #[strum(serialize_all = "snake_case")]
 pub enum LogFormat {

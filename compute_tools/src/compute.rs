@@ -978,7 +978,16 @@ impl ComputeNode {
                 )?;
 
                 // Launch a background task to clean up the audit logs
-                launch_pgaudit_gc(log_directory_path);
+                launch_pgaudit_gc(log_directory_path.clone());
+
+                // feat-031: tail audit log file → OTel `compute_audit_log_record` event ·
+                // 把 PostgreSQL pgaudit / pg_session_jwt.audit_log 输出走统一 OTLP 出口 ·
+                // 跟 mcp 侧 (openneon-mcp#110) `openneon.audit.*` schema 统一 (详设 §3.2 b)。
+                crate::audit_otel::launch_audit_otel_tail(
+                    log_directory_path,
+                    endpoint_id.to_string(),
+                    project_id.to_string(),
+                );
             }
             _ => {}
         }
