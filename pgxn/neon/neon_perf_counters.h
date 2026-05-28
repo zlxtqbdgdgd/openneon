@@ -169,6 +169,9 @@ extern neon_per_backend_counters *neon_per_backend_counters_shared;
 
 #define MyNeonCounters (&neon_per_backend_counters_shared[MyProcNumber])
 
+/* feat-012: rollback flag for histogram bucket jsonb export */
+extern bool neon_perf_counters_emit_buckets;
+
 extern void inc_getpage_wait(uint64 latency);
 extern void inc_page_cache_read_wait(uint64 latency);
 extern void inc_page_cache_write_wait(uint64 latency);

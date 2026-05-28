@@ -616,6 +616,17 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	/* feat-012: histogram bucket jsonb export rollback flag. */
+	DefineCustomBoolVariable(
+							"neon.perf_counters_emit_buckets",
+							"Emit per-histogram bucket arrays as jsonb in neon_perf_counters_histograms",
+							"When off, neon_perf_counters_histograms returns no rows and clients fall back to the sum/count columns.",
+							&neon_perf_counters_emit_buckets,
+							true,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
 	// A test hook used in sql regress to trigger specific behaviors
 	// to test features easily.
 	DefineCustomIntVariable(

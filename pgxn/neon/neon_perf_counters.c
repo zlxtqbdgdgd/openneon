@@ -16,10 +16,21 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
+#include "utils/jsonb.h"
 
 #include "neon.h"
 #include "neon_perf_counters.h"
 #include "walproposer.h"
+
+/*
+ * feat-012: gate for emitting the histogram bucket jsonb output of
+ * neon_get_perf_counters_histograms(). When off, that function returns no
+ * rows, so the neon_perf_counters_histograms view degrades to empty and
+ * clients fall back to the sum/count columns of neon_perf_counters. The
+ * existing neon_perf_counters / neon_backend_perf_counters views are not
+ * affected by this flag.
+ */
+bool		neon_perf_counters_emit_buckets = true;
 
 /* BEGIN_HADRON */
 databricks_metrics *databricks_metrics_shared;
@@ -478,6 +489,190 @@ neon_get_perf_counters(PG_FUNCTION_ARGS)
 			}
 		}
 		/* END_HADRON */
+	}
+
+	pfree(metrics);
+
+	return (Datum) 0;
+}
+
+/*
+ * feat-012: histogram bucket complete export (jsonb single column).
+ *
+ * neon_get_perf_counters() already emits, for every histogram metric, a set of
+ * cumulative <name>_bucket rows carrying a bucket_le upper bound plus a
+ * <name>_count / <name>_sum pair (Prometheus style). That long/EAV shape is
+ * agent-unfriendly: reconstructing a single histogram requires joining many
+ * rows. This function re-aggregates the same counters and, for each histogram
+ * metric, emits exactly ONE row carrying the full cumulative bucket array as a
+ * single jsonb value:
+ *
+ *   [ {"le": 1e-05, "count": 12}, ..., {"le": null, "count": 198782} ]
+ *
+ * Semantics (matches feat-012 design doc section 4):
+ *   - "le"    = bucket upper bound, "less than or equal" (seconds).
+ *   - "count" = CUMULATIVE count (monotonic non-decreasing across the array),
+ *               accumulated since backend start, exactly the value already used
+ *               by neon_get_perf_counters() bucket rows.
+ *   - The +Inf terminal bucket uses le = null (jsonb has no native infinity).
+ *   - The +Inf count equals the metric's <name>_count value (emit consistency).
+ *
+ * The histogram_buckets column is NULL only for the rollback path (the
+ * neon.perf_counters_emit_buckets GUC is off), in which case no rows are
+ * emitted at all. Non-histogram (gauge/counter) metrics are simply not present
+ * in this view, which the caller reads as "not applicable".
+ *
+ * This reuses the in-tree IOHistogram / QTHistogram counters and adds no new
+ * collector; the bucket edges stay the curated in-tree io_wait_bucket_thresholds
+ * / qt_bucket_thresholds sets (no user-defined buckets, to bound cardinality).
+ */
+static void
+emit_one_histogram(ReturnSetInfo *rsinfo, metric_t *metrics, int *idx,
+				   const char *base_name)
+{
+	Datum		values[2];
+	bool		nulls[2];
+	JsonbParseState *state = NULL;
+	JsonbValue *jbv;
+	Jsonb	   *jb;
+	int			i = *idx;
+	int			nbuckets PG_USED_FOR_ASSERTS_ONLY = 0;
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * Invariant guard: this function relies on the fact that all *_bucket rows
+	 * belonging to one histogram are emitted as a SINGLE contiguous run by
+	 * io_histogram_to_metrics() / qt_histogram_to_metrics(). The walk below
+	 * stops at the first non-bucket metric; so if a gauge/counter were ever
+	 * inserted in the middle of a bucket run, the histogram would be silently
+	 * truncated (and a second, bogus histogram emitted for the tail). We assert
+	 * that the run we consume has exactly the curated width for this histogram:
+	 * query_time uses NUM_QT_BUCKETS, every other (IO) histogram uses
+	 * NUM_IO_WAIT_BUCKETS. If you add a histogram with a different bucket count,
+	 * extend this mapping.
+	 */
+	int			expected_buckets =
+		(strcmp(base_name, "query_time_seconds") == 0)
+		? NUM_QT_BUCKETS
+		: NUM_IO_WAIT_BUCKETS;
+#endif
+
+	pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
+
+	/* Walk consecutive *_bucket entries that belong to this histogram. */
+	while (metrics[i].name != NULL && metrics[i].is_bucket)
+	{
+		JsonbValue	key;
+		JsonbValue	val;
+
+		pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+		/* "le": bucket upper bound, or null for the +Inf terminal bucket. */
+		key.type = jbvString;
+		key.val.string.val = "le";
+		key.val.string.len = strlen("le");
+		pushJsonbValue(&state, WJB_KEY, &key);
+
+		if (isinf(metrics[i].bucket_le))
+		{
+			val.type = jbvNull;
+		}
+		else
+		{
+			val.type = jbvNumeric;
+			val.val.numeric = DatumGetNumeric(DirectFunctionCall1(
+				float8_numeric, Float8GetDatum(metrics[i].bucket_le)));
+		}
+		pushJsonbValue(&state, WJB_VALUE, &val);
+
+		/* "count": cumulative count up to and including this bucket. */
+		key.type = jbvString;
+		key.val.string.val = "count";
+		key.val.string.len = strlen("count");
+		pushJsonbValue(&state, WJB_KEY, &key);
+
+		val.type = jbvNumeric;
+		val.val.numeric = DatumGetNumeric(DirectFunctionCall1(
+			float8_numeric, Float8GetDatum(metrics[i].value)));
+		pushJsonbValue(&state, WJB_VALUE, &val);
+
+		pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+		i++;
+		nbuckets++;
+	}
+
+	/*
+	 * Protect the contiguity invariant (see comment above): a complete bucket
+	 * run must have exactly the curated number of buckets. A short run means a
+	 * non-bucket metric was interleaved and silently split the histogram.
+	 */
+	Assert(nbuckets == expected_buckets);
+
+	jbv = pushJsonbValue(&state, WJB_END_ARRAY, NULL);
+	jb = JsonbValueToJsonb(jbv);
+
+	values[0] = CStringGetTextDatum(base_name);
+	nulls[0] = false;
+	values[1] = JsonbPGetDatum(jb);
+	nulls[1] = false;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+	*idx = i;
+}
+
+PG_FUNCTION_INFO_V1(neon_get_perf_counters_histograms);
+Datum
+neon_get_perf_counters_histograms(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	neon_per_backend_counters totals = {0};
+	metric_t   *metrics;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* Rollback path: emit no rows, clients fall back to sum/count. */
+	if (!neon_perf_counters_emit_buckets)
+		return (Datum) 0;
+
+	/* Aggregate the counters across all backends (same as neon_get_perf_counters). */
+	for (int procno = 0; procno < NUM_NEON_PERF_COUNTER_SLOTS; procno++)
+	{
+		neon_per_backend_counters *counters = &neon_per_backend_counters_shared[procno];
+
+		io_histogram_merge_into(&totals.getpage_hist, &counters->getpage_hist);
+		io_histogram_merge_into(&totals.file_cache_read_hist, &counters->file_cache_read_hist);
+		io_histogram_merge_into(&totals.file_cache_write_hist, &counters->file_cache_write_hist);
+		qt_histogram_merge_into(&totals.query_time_hist, &counters->query_time_hist);
+	}
+
+	metrics = neon_perf_counters_to_metrics(&totals);
+
+	/*
+	 * Walk the metric list. Every histogram is materialized as a contiguous
+	 * run of <name>_count, <name>_sum, then NUM_*_BUCKETS *_bucket rows. We key
+	 * the emitted row on the histogram base name (the metric name with the
+	 * "_bucket" suffix stripped) and consume the whole bucket run.
+	 */
+	for (int i = 0; metrics[i].name != NULL; /* advanced inside */)
+	{
+		if (metrics[i].is_bucket)
+		{
+			const char *bucket_name = metrics[i].name;
+			const char *suffix = strstr(bucket_name, "_bucket");
+			char	   *base_name;
+
+			if (suffix != NULL)
+				base_name = pnstrdup(bucket_name, suffix - bucket_name);
+			else
+				base_name = pstrdup(bucket_name);
+
+			emit_one_histogram(rsinfo, metrics, &i, base_name);
+			pfree(base_name);
+		}
+		else
+		{
+			/* scalar (count/sum/gauge/counter): not a histogram, skip. */
+			i++;
+		}
 	}
 
 	pfree(metrics);
