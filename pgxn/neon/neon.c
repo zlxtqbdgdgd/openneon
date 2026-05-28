@@ -627,6 +627,17 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	/* feat-013: neon_safekeeper_lsn view rollback flag. */
+	DefineCustomBoolVariable(
+							"neon.safekeeper_lsn_view_enabled",
+							"Expose per-safekeeper LSNs via the neon_safekeeper_lsn view",
+							"When off, neon_safekeeper_lsn returns no rows and clients fall back to pg_stat_replication.",
+							&neon_safekeeper_lsn_view_enabled,
+							true,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
 	// A test hook used in sql regress to trigger specific behaviors
 	// to test features easily.
 	DefineCustomIntVariable(

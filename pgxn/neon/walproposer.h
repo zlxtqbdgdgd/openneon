@@ -437,6 +437,31 @@ typedef struct WalproposerShmemState
 	/* Per-safekeeper status flags: 0=inactive, 1=active */
 	uint8 safekeeper_status[MAX_SAFEKEEPERS];
 	/* END_HADRON */
+
+	/*
+	 * feat-013: per-safekeeper LSN snapshot for the neon_safekeeper_lsn view.
+	 *
+	 * The walproposer process already tracks, per connected safekeeper, the
+	 * commit/flush LSN it last reported and the pageserver remote_consistent
+	 * LSN piggybacked in that safekeeper's feedback. We mirror the latest
+	 * values into shared memory on every AppendResponse so a regular backend
+	 * (which cannot read the walproposer process's private WalProposer struct)
+	 * can serve them via SQL without issuing any new query to the safekeeper.
+	 *
+	 * All fields are guarded by the existing `mutex` spinlock. Indexed by the
+	 * safekeeper's slot index in WalProposer->safekeeper[], same indexing as
+	 * safekeeper_status above.
+	 *
+	 * Note: there is no backup_lsn here. backup_lsn is a safekeeper-internal
+	 * value only exposed over the safekeeper HTTP /v1/timeline/<ttid>/status
+	 * API; it is NOT carried in the walproposer append protocol, so the SQL
+	 * view reports it as NULL (fail-honest "not available via this path").
+	 */
+	XLogRecPtr	safekeeper_commit_lsn[MAX_SAFEKEEPERS];
+	XLogRecPtr	safekeeper_flush_lsn[MAX_SAFEKEEPERS];
+	XLogRecPtr	safekeeper_remote_consistent_lsn[MAX_SAFEKEEPERS];
+	/* compute-local timestamp of the last AppendResponse mirrored, per sk */
+	TimestampTz	safekeeper_lsn_updated_at[MAX_SAFEKEEPERS];
 } WalproposerShmemState;
 
 /*
@@ -757,6 +782,16 @@ typedef struct walproposer_api
 	void		(*update_safekeeper_status_for_metrics) (WalProposer *wp, uint32 sk_index, uint8 status);
 
 	/* END_HADRON */
+
+	/*
+	 * feat-013: mirror the latest LSNs reported by one safekeeper into shared
+	 * memory, so the neon_safekeeper_lsn SQL view can serve them from a normal
+	 * backend. Called from the walproposer process after each AppendResponse.
+	 */
+	void		(*update_safekeeper_lsns_for_metrics) (WalProposer *wp, uint32 sk_index,
+													   XLogRecPtr commit_lsn,
+													   XLogRecPtr flush_lsn,
+													   XLogRecPtr remote_consistent_lsn);
 } walproposer_api;
 
 /*

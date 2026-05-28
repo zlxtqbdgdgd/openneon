@@ -172,6 +172,9 @@ extern neon_per_backend_counters *neon_per_backend_counters_shared;
 /* feat-012: rollback flag for histogram bucket jsonb export */
 extern bool neon_perf_counters_emit_buckets;
 
+/* feat-013: rollback flag for the neon_safekeeper_lsn view */
+extern bool neon_safekeeper_lsn_view_enabled;
+
 extern void inc_getpage_wait(uint64 latency);
 extern void inc_page_cache_read_wait(uint64 latency);
 extern void inc_page_cache_write_wait(uint64 latency);
