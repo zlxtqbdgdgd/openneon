@@ -37,3 +37,7 @@ docker-compose/docker-compose-parallel.yml
 # various files for local testing
 /proxy/.subzero
 local_proxy.json
+
+# feat-034 trace status / sqlcommenter test artifacts
+pgxn/neon/test/sqlcommenter_test
+pgxn/neon/test/trace_context_test

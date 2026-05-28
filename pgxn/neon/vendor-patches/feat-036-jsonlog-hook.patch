@@ -1,0 +1,31 @@
+diff --git a/src/backend/utils/error/jsonlog.c b/src/backend/utils/error/jsonlog.c
+index 2c7b14c..36055bc 100644
+--- a/src/backend/utils/error/jsonlog.c
++++ b/src/backend/utils/error/jsonlog.c
+@@ -28,6 +28,15 @@
+ #include "utils/json.h"
+ #include "utils/ps_status.h"
+ 
++
++/*
++ * feat-036 . Neon-only hook point. Set by pgxn/neon/jsonlog_ext.c::_PG_init.
++ * When non-NULL, called before write_jsonlog closes the JSON object with '}'.
++ * Default NULL = upstream PG jsonlog unchanged byte-for-byte.
++ */
++typedef void (*append_extra_jsonlog_fields_hook_type) (StringInfo buf);
++append_extra_jsonlog_fields_hook_type append_extra_jsonlog_fields_hook = NULL;
++
+ static void appendJSONKeyValueFmt(StringInfo buf, const char *key,
+ 								  bool escape_key,
+ 								  const char *fmt,...) pg_attribute_printf(4, 5);
+@@ -287,6 +296,10 @@ write_jsonlog(ErrorData *edata)
+ 	appendJSONKeyValueFmt(&buf, "query_id", false, "%lld",
+ 						  (long long) pgstat_get_my_query_id());
+ 
++	/* feat-036 . Neon-only field injection; hook NULL by default keeps upstream PG behavior. */
++	if (append_extra_jsonlog_fields_hook != NULL)
++		(*append_extra_jsonlog_fields_hook) (&buf);
++
+ 	/* Finish string */
+ 	appendStringInfoChar(&buf, '}');
+ 	appendStringInfoChar(&buf, '\n');
