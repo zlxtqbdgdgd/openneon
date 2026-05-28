@@ -6412,6 +6412,7 @@ name = "safekeeper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-stream",
  "byteorder",
  "bytes",
@@ -8427,6 +8428,7 @@ dependencies = [
  "metrics",
  "nix 0.30.1",
  "once_cell",
+ "opentelemetry",
  "pem",
  "pin-project-lite",
  "postgres_connection",

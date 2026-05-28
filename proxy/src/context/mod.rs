@@ -15,6 +15,7 @@ use self::parquet::RequestData;
 use crate::control_plane::messages::{ColdStartInfo, MetricsAuxInfo};
 use crate::error::ErrorKind;
 use crate::intern::{BranchIdInt, ProjectIdInt};
+use crate::trace_context::TraceContext;
 use crate::metrics::{LatencyAccumulated, LatencyTimer, Metrics, Protocol, Waiting};
 use crate::pqproto::StartupMessageParams;
 use crate::protocol2::{ConnectionInfo, ConnectionInfoExtra};
@@ -56,6 +57,9 @@ struct RequestContextInner {
     error_kind: Option<ErrorKind>,
     pub(crate) auth_method: Option<AuthMethod>,
     jwt_issuer: Option<String>,
+    /// feat-065 · proxy traceparent 透传 / 自生（path α / β）。
+    /// path α 时是上游 app 给的 SpanContext；path β 时是 proxy entry 自生的。
+    trace_context: Option<TraceContext>,
     success: bool,
     pub(crate) cold_start_info: ColdStartInfo,
     pg_options: Option<StartupMessageParams>,
@@ -100,6 +104,7 @@ impl Clone for RequestContext {
             error_kind: inner.error_kind,
             auth_method: inner.auth_method.clone(),
             jwt_issuer: inner.jwt_issuer.clone(),
+            trace_context: inner.trace_context.clone(),
             success: inner.success,
             cold_start_info: inner.cold_start_info,
             pg_options: inner.pg_options.clone(),
@@ -144,6 +149,7 @@ impl RequestContext {
             error_kind: None,
             auth_method: None,
             jwt_issuer: None,
+            trace_context: None,
             success: false,
             cold_start_info: ColdStartInfo::Unknown,
             pg_options: None,
@@ -265,6 +271,22 @@ impl RequestContext {
     pub(crate) fn set_jwt_issuer(&self, jwt_issuer: String) {
         let mut this = self.0.try_lock().expect("should not deadlock");
         this.jwt_issuer = Some(jwt_issuer);
+    }
+
+    /// feat-065 path α/β 分流后写入。proxy entry 在 handshake 拿到 startup params
+    /// 后调用一次：要么解析上游 traceparent（path α），要么自生（path β）。
+    pub(crate) fn set_trace_context(&self, tc: TraceContext) {
+        let mut this = self.0.try_lock().expect("should not deadlock");
+        this.trace_context = Some(tc);
+    }
+
+    /// 读出 trace_context（注入 compute startup options 时用）。
+    pub(crate) fn trace_context(&self) -> Option<TraceContext> {
+        self.0
+            .try_lock()
+            .expect("should not deadlock")
+            .trace_context
+            .clone()
     }
 
     pub fn has_private_peer_addr(&self) -> bool {
