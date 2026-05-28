@@ -813,6 +813,34 @@ typedef struct walproposer_api
 													   XLogRecPtr commit_lsn,
 													   XLogRecPtr flush_lsn,
 													   XLogRecPtr remote_consistent_lsn);
+
+	/*
+	 * feat-035: outbound W3C traceparent for the START_WAL_PUSH command
+	 * (segment 1: compute -> safekeeper).
+	 *
+	 * Returns 1 if the buffer was filled with a NUL-terminated 55-byte
+	 * traceparent value (TRACE_CONTEXT_WIRE_LEN); 0 otherwise (caller should
+	 * skip the traceparent KV in the command).
+	 *
+	 * Postgres-side impl (walproposer_pg.c) should source trace_id from
+	 * `PgBackendStatus.trace_context` (feat-033/#3). Until that field lands
+	 * on this branch, the impl self-generates a random root and emits
+	 * `tracestate=neon=root=walproposer` to mark this segment as the trace
+	 * origin. Simulation/mock impls typically just return 0.
+	 *
+	 * `buf` / `buflen`: traceparent destination buffer; must hold at least
+	 *					 TRACE_CONTEXT_BUF_SIZE = 56 bytes.
+	 * `tracestate_buf` / `tracestate_buflen`: optional sibling W3C §3.3
+	 *					 tracestate buffer; nullable. Caller can pass NULL.
+	 * `tracestate_len_out`: out-parameter, length of the tracestate string
+	 *					 (0 if none was emitted). Nullable when tracestate_buf
+	 *					 is NULL.
+	 */
+	int			(*get_outbound_traceparent) (WalProposer *wp,
+											 char *buf, size_t buflen,
+											 char *tracestate_buf,
+											 size_t tracestate_buflen,
+											 size_t *tracestate_len_out);
 } walproposer_api;
 
 /*
