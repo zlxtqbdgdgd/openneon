@@ -1,0 +1,6 @@
+# reject 原因：denylist 中含非法 regex '[unclosed' · 不能 re.compile (R2/S1)
+# schema 层允许 (minLength:1) · 由 validate_whitelist.py 第二阶段拒绝
+version: 1
+denylist:
+  usdt_probe_patterns:
+    - "[unclosed"

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -50,11 +51,50 @@ def load_doc(path: Path):
 
 
 def validate(schema: dict, doc, path: Path) -> list[str]:
+    """Schema 层 + 语义层 (跨字段 / regex 合法性) 双重校验。"""
     validator = Draft7Validator(schema)
     errors = []
     for err in sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path)):
         loc = "/".join(str(p) for p in err.absolute_path) or "<root>"
         errors.append(f"{path}: {loc}: {err.message}")
+
+    # Schema 层完全失败时不再跑语义层 (字段类型未知, 容易二次抛错)
+    if errors:
+        return errors
+
+    # 语义层 1 (R2/S1 升级为必修):
+    # denylist 的每条 pattern 必须能被 re.compile, 否则 feat-068 attach
+    # 时漏整条 deny —— 这是安全语义问题不是工程便利问题。
+    if isinstance(doc, dict):
+        denylist = doc.get("denylist") or {}
+        for section in ("usdt_probe_patterns", "uprobe_symbol_patterns"):
+            patterns = denylist.get(section) or []
+            for i, pat in enumerate(patterns):
+                if not isinstance(pat, str):
+                    continue  # schema 已拒非字符串
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    errors.append(
+                        f"{path}: denylist/{section}/{i}: "
+                        f"invalid regex {pat!r}: {e}"
+                    )
+
+    # 语义层 2 (R1/S2):
+    # usdt entry 的 pg_version_min > pg_version_max 跨字段校验
+    # (jsonschema draft-07 不支持跨字段比较, 由 Python 层兜底)
+    if isinstance(doc, dict):
+        for i, entry in enumerate(doc.get("usdt") or []):
+            if not isinstance(entry, dict):
+                continue
+            vmin = entry.get("pg_version_min")
+            vmax = entry.get("pg_version_max")
+            if isinstance(vmin, int) and isinstance(vmax, int) and vmin > vmax:
+                errors.append(
+                    f"{path}: usdt/{i}: pg_version_min ({vmin}) > "
+                    f"pg_version_max ({vmax})"
+                )
+
     return errors
 
 
