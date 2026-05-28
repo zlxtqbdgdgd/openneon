@@ -29,6 +29,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
+#include "utils/timestamp.h"
 
 #include "communicator.h"
 #include "communicator_process.h"
@@ -833,6 +834,55 @@ local_cache_pages(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 
 #undef NUM_LOCALCACHE_PAGES_COLS
+}
+
+/*
+ * feat-014: per-relation LFC stats SRF backing neon_lfc_stats_per_relation.
+ *
+ * Emits one row per relation tracked by the LFC, keyed on relfilenode (the LFC
+ * keys cache entries by relfilenode, not pg_class.oid). The SQL view LEFT JOINs
+ * pg_class on relfilenode to recover relname/relkind, keeping orphan rows (a
+ * relation dropped while its pages linger in the LFC) with relname = NULL.
+ */
+PG_FUNCTION_INFO_V1(neon_get_lfc_stats_per_relation);
+Datum
+neon_get_lfc_stats_per_relation(PG_FUNCTION_ARGS)
+{
+#define NUM_LFC_PER_REL_COLS	8
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	LfcPerRelStatsRec *entries;
+	size_t		num_entries;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	entries = lfc_get_per_relation_stats(&num_entries);
+
+	for (size_t i = 0; i < num_entries; i++)
+	{
+		LfcPerRelStatsRec *entry = &entries[i];
+		Datum		values[NUM_LFC_PER_REL_COLS];
+		bool		nulls[NUM_LFC_PER_REL_COLS];
+
+		memset(nulls, false, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(entry->relfilenode);
+		values[1] = ObjectIdGetDatum(entry->reltablespace);
+		values[2] = ObjectIdGetDatum(entry->reldatabase);
+		values[3] = Int64GetDatum(entry->pages_in_cache);
+		values[4] = Int64GetDatum((int64) entry->hits);
+		values[5] = Int64GetDatum((int64) entry->misses);
+		values[6] = Int64GetDatum((int64) entry->evictions);
+		if (entry->last_access != 0)
+			values[7] = TimestampTzGetDatum(entry->last_access);
+		else
+			nulls[7] = true;
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	PG_RETURN_VOID();
+
+#undef NUM_LFC_PER_REL_COLS
 }
 
 /*
