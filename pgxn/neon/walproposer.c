@@ -43,6 +43,12 @@
 #include "walproposer.h"
 #include "neon_utils.h"
 
+/* feat-034 path β: SQLCommenter injection into walproposer SQL. */
+#ifndef WALPROPOSER_LIB
+#include "sqlcommenter.h"
+#include "neon_trace_status.h"
+#endif
+
 /* Prototypes for private functions */
 static void WalProposerLoop(WalProposer *wp);
 static void ShutdownConnection(Safekeeper *sk);
@@ -651,6 +657,17 @@ HandleConnectionEvent(Safekeeper *sk)
  * Send "START_WAL_PUSH" message as an empty query to the safekeeper. Performs
  * a blocking send, then immediately moves to SS_WAIT_EXEC_RESULT. If something
  * goes wrong, change state to SS_OFFLINE and shutdown the connection.
+ *
+ * feat-034 path β: if this walproposer process currently holds a
+ * trace_context (set via post_parse_analyze_hook from the upstream
+ * client query that triggered the WAL flush, OR by proxy entry at the
+ * very start of the connection), we URL-encode it as a SQLCommenter
+ * `traceparent='...'` block and append it to `cmd`. The safekeeper /
+ * pageserver then sees `tracestate='neon=root=proxy'` (or whatever the
+ * upstream set) so it can attribute its OpenTelemetry spans to the
+ * same trace_id. This is the Neon-internal cross-process trace handoff
+ * that Datadog DBM cannot do (they only see client→DB; they never get
+ * to modify the DB internals to forward IDs further).
  */
 static void
 SendStartWALPush(Safekeeper *sk)
@@ -667,10 +684,18 @@ SendStartWALPush(Safekeeper *sk)
 	if (!wp->api.conn_send_query(sk, cmd))
 	{
 		wp_log(WARNING, "failed to send '%s' query to safekeeper %s:%s: %s",
-			   cmd, sk->host, sk->port, wp->api.conn_error_message(sk));
+			   cmd_to_send, sk->host, sk->port, wp->api.conn_error_message(sk));
+#ifndef WALPROPOSER_LIB
+		if (cmd_with_trace != NULL)
+			free(cmd_with_trace);
+#endif
 		ShutdownConnection(sk);
 		return;
 	}
+#ifndef WALPROPOSER_LIB
+	if (cmd_with_trace != NULL)
+		free(cmd_with_trace);
+#endif
 	sk->state = SS_WAIT_EXEC_RESULT;
 	wp->api.update_event_set(sk, WL_SOCKET_READABLE);
 }

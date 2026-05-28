@@ -43,6 +43,12 @@
 #include "unstable_extensions.h"
 #include "walsender_hooks.h"
 #include "jsonlog_ext.h"
+
+/* feat-034: SQLCommenter path α (post_parse_analyze hook) */
+#include "parser/analyze.h"
+#include "sqlcommenter.h"
+#include "neon_trace_status.h"
+
 #if PG_MAJORVERSION_NUM >= 16
 #include "storage/ipc.h"
 #endif
@@ -61,6 +67,18 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static void neon_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void neon_ExecutorEnd(QueryDesc *queryDesc);
+
+/*
+ * feat-034 path α: post_parse_analyze_hook signature drifted across PG
+ * majors. v14/v15 take (ParseState, Query); v16+ added JumbleState.
+ */
+static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+#if PG_MAJORVERSION_NUM >= 16
+static void neon_post_parse_analyze(ParseState *pstate, Query *query,
+									JumbleState *jstate);
+#else
+static void neon_post_parse_analyze(ParseState *pstate, Query *query);
+#endif
 
 static shmem_startup_hook_type prev_shmem_startup_hook;
 static void neon_shmem_startup_hook(void);
@@ -717,6 +735,10 @@ _PG_init(void)
 
 	/* feat-036 · PG jsonlog + Neon 字段注入 hook (~30 LOC vendor patch + 280 LOC extension); default mask 全开. */
 	jsonlog_ext_init();
+
+	/* feat-034 path α: install SQLCommenter extractor hook. */
+	prev_post_parse_analyze_hook = post_parse_analyze_hook;
+	post_parse_analyze_hook = neon_post_parse_analyze;
 }
 
 /* Various functions exposed at SQL level */
@@ -941,6 +963,7 @@ neon_shmem_request_hook(void)
 	RelsizeCacheShmemRequest();
 	WalproposerShmemRequest();
 	LwLsnCacheShmemRequest();
+	NeonTraceStatusShmemRequest();		/* feat-034 path α */
 }
 
 
@@ -966,6 +989,7 @@ neon_shmem_startup_hook(void)
 	RelsizeCacheShmemInit();
 	WalproposerShmemInit();
 	LwLsnCacheShmemInit();
+	NeonTraceStatusShmemInit();			/* feat-034 path α */
 
 #if PG_MAJORVERSION_NUM >= 17
 	WAIT_EVENT_NEON_LFC_MAINTENANCE = WaitEventExtensionNew("Neon/FileCache_Maintenance");
@@ -1033,4 +1057,136 @@ neon_ExecutorEnd(QueryDesc *queryDesc)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+
+	/*
+	 * feat-034 path α: clear this backend's trace status so a subsequent
+	 * untagged query does NOT inherit the prior trace_id. The
+	 * post_parse_analyze hook will repopulate it for the next query.
+	 */
+	neon_trace_status_clear();
+}
+
+/*
+ * feat-034 path α: post_parse_analyze hook.
+ *
+ * Runs after the parser/analyzer for every top-level statement. We
+ * extract a sqlcommenter `traceparent='...'` KV (if present in the
+ * trailing block comment) and stash the decoded trace_context into
+ * this backend's slot. The `neon_stat_activity` view (defined in the
+ * extension SQL) joins pg_stat_activity with the slot table on PID.
+ *
+ * Per-query semantics: this hook also OVERRIDES any connection-level
+ * trace_context that was previously written via startup-options
+ * (feat-065 path) — per-query KVs are authoritative because they
+ * represent the application's most recent intent.
+ *
+ * Errors here MUST NOT propagate. The extractor returns false on any
+ * malformed input; we silently skip in that case to avoid surfacing a
+ * parse error to a query that is otherwise valid SQL.
+ */
+static void
+#if PG_MAJORVERSION_NUM >= 16
+neon_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+#else
+neon_post_parse_analyze(ParseState *pstate, Query *query)
+#endif
+{
+	/* Chain to upstream hook (if any) first; never swallow its effects. */
+	if (prev_post_parse_analyze_hook != NULL)
+	{
+#if PG_MAJORVERSION_NUM >= 16
+		prev_post_parse_analyze_hook(pstate, query, jstate);
+#else
+		prev_post_parse_analyze_hook(pstate, query);
+#endif
+	}
+
+	if (pstate == NULL || pstate->p_sourcetext == NULL)
+		return;
+
+	struct trace_context tc;
+	char	   *tracestate = NULL;
+
+	if (sqlcommenter_extract_traceparent(pstate->p_sourcetext, &tc, &tracestate))
+	{
+		neon_trace_status_set(&tc, tracestate);
+	}
+	/* tracestate is heap-allocated by sqlcommenter (uses malloc, NOT palloc) */
+	if (tracestate != NULL)
+		free(tracestate);
+}
+
+/*
+ * feat-034/#24: SRF backing the `neon_stat_activity` view.
+ *
+ * Schema: (pid int4, trace_id text, span_id text, trace_flags int2,
+ *          sampled bool, tracestate text)
+ *
+ * The SQL view (in neon--1.7--1.8.sql) LEFT JOINs pg_stat_activity on
+ * pid so unrelated rows (system backends, walwriter, autovacuum) get
+ * NULL trace_id / span_id and remain visible.
+ *
+ * Wire format of trace_id / span_id: lowercase hex, no dashes, no `0x`
+ * prefix. Matches the form Datadog DBM / OTel exporters emit so the
+ * dashboard query `WHERE trace_id = '...'` is a direct match against
+ * the OTLP-exported value.
+ */
+#define NUM_TRACE_STATUS_COLS 6
+
+typedef struct TraceStatusCollectCtx
+{
+	ReturnSetInfo *rsinfo;
+} TraceStatusCollectCtx;
+
+static void
+hex_encode_to_text(const uint8_t *src, size_t len, char *dst)
+{
+	static const char hex_lc[] = "0123456789abcdef";
+
+	for (size_t i = 0; i < len; i++)
+	{
+		dst[2 * i] = hex_lc[(src[i] >> 4) & 0x0f];
+		dst[2 * i + 1] = hex_lc[src[i] & 0x0f];
+	}
+	dst[2 * len] = '\0';
+}
+
+static void
+trace_status_visit(const NeonTraceStatus *slot, void *ctx)
+{
+	TraceStatusCollectCtx *cctx = (TraceStatusCollectCtx *) ctx;
+	Datum		values[NUM_TRACE_STATUS_COLS];
+	bool		nulls[NUM_TRACE_STATUS_COLS] = {false, false, false, false, false, false};
+	char		trace_id_hex[33];
+	char		span_id_hex[17];
+
+	hex_encode_to_text(slot->tc.trace_id, 16, trace_id_hex);
+	hex_encode_to_text(slot->tc.parent_id, 8, span_id_hex);
+
+	values[0] = Int32GetDatum(slot->pid);
+	values[1] = CStringGetTextDatum(trace_id_hex);
+	values[2] = CStringGetTextDatum(span_id_hex);
+	values[3] = Int16GetDatum((int16) slot->tc.trace_flags);
+	values[4] = BoolGetDatum((slot->tc.trace_flags & 0x01) != 0);
+	if (slot->tracestate[0] == '\0')
+		nulls[5] = true;
+	else
+		values[5] = CStringGetTextDatum(slot->tracestate);
+
+	tuplestore_putvalues(cctx->rsinfo->setResult, cctx->rsinfo->setDesc,
+						 values, nulls);
+}
+
+PG_FUNCTION_INFO_V1(neon_get_trace_status);
+Datum
+neon_get_trace_status(PG_FUNCTION_ARGS)
+{
+	TraceStatusCollectCtx cctx;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	cctx.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	neon_trace_status_iterate(trace_status_visit, &cctx);
+
+	PG_RETURN_VOID();
 }
