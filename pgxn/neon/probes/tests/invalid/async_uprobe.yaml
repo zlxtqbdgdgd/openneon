@@ -1,0 +1,8 @@
+# reject 原因：L3 白名单只允许同步函数 · is_async=true 被 schema 拒
+version: 1
+uprobe:
+  - binary: pageserver
+    symbol: "pageserver::tenant::handle_get_page"
+    module: "pageserver::tenant"
+    type: sync_fn
+    is_async: true

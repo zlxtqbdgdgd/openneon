@@ -1,0 +1,3 @@
+# reject 原因：version=2 还没定义 (schema 当前只接受 1)
+version: 2
+usdt: []

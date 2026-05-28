@@ -1,0 +1,6 @@
+# reject 原因：usdt subsystem 'magic' 不在 enum 内
+version: 1
+usdt:
+  - target: postgresql
+    probe_name: "query__start"
+    subsystem: magic

@@ -1,0 +1,22 @@
+# 独立 denylist fixture · 演示「只下黑名单 · 完全 deny by default」用法
+# A4/A5 实际部署可走 whitelist.yaml 内嵌 denylist · 也可走这个独立文件
+# schema 同一份 · whitelist 段缺省即「无白名单 · 全 deny」
+version: 1
+
+denylist:
+  usdt_probe_patterns:
+    - "^pg_md5_hash.*"
+    - "^scram_.*"
+    - "^be_tls_.*"
+    - "^be_gssapi_.*"
+    - "^get_role_password$"
+    - "^verify_token$"
+    - "^check_password_hash$"
+
+  uprobe_symbol_patterns:
+    - ".*::scram_.*"
+    - ".*::sasl::.*"
+    - ".*::tls::handshake.*"
+    - ".*::password::.*"
+    - ".*::token::verify.*"
+    - ".*::crypto::aead.*"
