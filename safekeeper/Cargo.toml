@@ -77,6 +77,10 @@ nix.workspace = true
 
 workspace_hack.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# feat-069-binary-wire (D4) · USDT provider 接入 · Linux only
+neon_probes = { path = "../pgxn/neon/probes/rust" }
+
 [dev-dependencies]
 criterion.workspace = true
 itertools.workspace = true
