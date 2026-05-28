@@ -186,12 +186,7 @@ WalProposerCreate(WalProposerConfig *config, walproposer_api api)
 	}
 	wp->quorum = wp->n_safekeepers / 2 + 1;
 
-	/*
-	 * feat-035 §4.5 兼容矩阵: proto v4 加 traceparent KV (向后兼容, v3 SK
-	 * silent ignore unknown KV). v2/v3 老逻辑不变。
-	 */
-	if (wp->config->proto_version != 2 && wp->config->proto_version != 3
-		&& wp->config->proto_version != 4)
+	if (wp->config->proto_version != 2 && wp->config->proto_version != 3)
 		wp_log(FATAL, "unsupported safekeeper protocol version %d", wp->config->proto_version);
 	if (wp->safekeepers_generation > INVALID_GENERATION && wp->config->proto_version < 3)
 		wp_log(FATAL, "enabling generations requires protocol version 3");
@@ -681,53 +676,11 @@ SendStartWALPush(Safekeeper *sk)
 
 	/* Forbid implicit timeline creation if generations are enabled. */
 	char	   *allow_timeline_creation = WalProposerGenerationsEnabled(wp) ? "false" : "true";
-#define CMD_LEN 1024
+#define CMD_LEN 512
 	char		cmd[CMD_LEN];
 
-	/*
-	 * feat-035 段 1 (compute → SK): proto_version >= 4 时附加 W3C traceparent KV.
-	 * 来源由 walproposer_api::get_outbound_traceparent 提供（Postgres-side 走
-	 * PgBackendStatus.trace_context, feat-033/#3; 未注入时自生 root + 配套
-	 * tracestate=neon=root=walproposer）。
-	 *
-	 * SK 端 §4.5 兼容矩阵: v3 SK 收到 v4 命令含 traceparent → silent ignore
-	 * unknown KV (handler.rs parse_cmd 已统一 forward-compat).
-	 */
-	char		tp_buf[64];				/* TRACE_CONTEXT_BUF_SIZE = 56, 上取整 */
-	char		ts_buf[256];			/* tracestate sibling, ASCII */
-	size_t		ts_len = 0;
-	bool		emit_traceparent = false;
-	int			ret;
 
-	if (wp->config->proto_version >= 4 && wp->api.get_outbound_traceparent != NULL)
-	{
-		ret = wp->api.get_outbound_traceparent(wp,
-											   tp_buf, sizeof(tp_buf),
-											   ts_buf, sizeof(ts_buf),
-											   &ts_len);
-		if (ret == 1)
-			emit_traceparent = true;
-	}
-
-	if (emit_traceparent && ts_len > 0)
-	{
-		snprintf(cmd, CMD_LEN,
-				 "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s', traceparent '%s', tracestate '%.*s')",
-				 wp->config->proto_version, allow_timeline_creation,
-				 tp_buf, (int) ts_len, ts_buf);
-	}
-	else if (emit_traceparent)
-	{
-		snprintf(cmd, CMD_LEN,
-				 "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s', traceparent '%s')",
-				 wp->config->proto_version, allow_timeline_creation, tp_buf);
-	}
-	else
-	{
-		snprintf(cmd, CMD_LEN,
-				 "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s')",
-				 wp->config->proto_version, allow_timeline_creation);
-	}
+	snprintf(cmd, CMD_LEN, "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s')", wp->config->proto_version, allow_timeline_creation);
 	if (!wp->api.conn_send_query(sk, cmd))
 	{
 		wp_log(WARNING, "failed to send '%s' query to safekeeper %s:%s: %s",
@@ -2294,16 +2247,12 @@ MembershipConfigurationSerialize(MembershipConfiguration *mconf, StringInfo buf)
 static void
 PAMessageSerialize(WalProposer *wp, ProposerAcceptorMessage *msg, StringInfo buf, int proto_version)
 {
-	/*
-	 * v2/v3 are the legacy wire formats. feat-035 v4 adds traceparent KV in
-	 * START_WAL_PUSH but reuses v3's binary message layout — so v4 falls
-	 * through to the v3 branch below for actual message serialization.
-	 */
-	Assert(proto_version == 4 || proto_version == 3 || proto_version == 2);
+	/* both version are supported currently until we fully migrate to 3 */
+	Assert(proto_version == 3 || proto_version == 2);
 
 	resetStringInfo(buf);
 
-	if (proto_version == 3 || proto_version == 4)
+	if (proto_version == 3)
 	{
 		/*
 		 * v2 sends structs for some messages as is, so commonly send tag only
@@ -2564,7 +2513,7 @@ AsyncReadMessage(Safekeeper *sk, AcceptorProposerMessage *anymsg)
 	s.maxlen = buf_size;
 	s.cursor = 0;
 
-	if (wp->config->proto_version == 3 || wp->config->proto_version == 4)
+	if (wp->config->proto_version == 3)
 	{
 		tag = pq_getmsgbyte(&s);
 		if (tag != anymsg->tag)

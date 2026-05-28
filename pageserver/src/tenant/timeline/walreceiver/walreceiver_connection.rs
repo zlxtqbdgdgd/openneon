@@ -25,7 +25,6 @@ use tokio_postgres::replication::ReplicationStream;
 use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, trace, warn};
-use tracing_utils::trace_context::{NEON_ROOT_PAGESERVER_WALRECEIVER, TraceContext};
 use utils::critical_timeline;
 use utils::id::NodeId;
 use utils::lsn::Lsn;
@@ -271,28 +270,7 @@ pub(super) async fn handle_walreceiver_connection(
         "last_record_lsn {last_rec_lsn} starting replication from {startpoint}, safekeeper is at {end_of_wal}..."
     );
 
-    // feat-035 段 2 (SK → pageserver): pageserver walreceiver 出口侧把当前 OTel
-    // span 上的 trace 继续往 SK 透。当 walreceiver 是被上游 GetPage@LSN 触发的
-    // catch-up 拉起来时有父 span，承接它；后台 lazy catch-up 没有上游 span 时,
-    // self-generate root + `tracestate=neon=root=pageserver-walreceiver` 让 trace
-    // UI 知道这一段链路的根来自哪里。
-    let (trace_ctx, root_tracestate) =
-        TraceContext::current_or_root(NEON_ROOT_PAGESERVER_WALRECEIVER);
-    let traceparent = trace_ctx.to_wire();
-    info!(
-        trace_id = %trace_ctx.trace_id_hex(),
-        span_id = %trace_ctx.span_id_hex(),
-        self_generated = %root_tracestate.is_some(),
-        "starting WAL receiver stream with traceparent"
-    );
-    let query = match root_tracestate {
-        Some(ts) => format!(
-            "START_REPLICATION PHYSICAL {startpoint} (traceparent '{traceparent}', tracestate '{ts}')"
-        ),
-        None => format!(
-            "START_REPLICATION PHYSICAL {startpoint} (traceparent '{traceparent}')"
-        ),
-    };
+    let query = format!("START_REPLICATION PHYSICAL {startpoint}");
 
     let copy_stream = replication_client.copy_both_simple(&query).await?;
     let mut physical_stream = pin!(ReplicationStream::new(copy_stream));

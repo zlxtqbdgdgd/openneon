@@ -1,0 +1,8 @@
+# reject 原因：symbol 含未闭合的泛型尖括号 'foo::Bar<unclosed' · 旧 pattern 会通过 (R2/M1+N5)
+version: 1
+uprobe:
+  - binary: pageserver
+    symbol: "foo::Bar<unclosed"
+    module: "foo"
+    type: sync_fn
+    is_async: false

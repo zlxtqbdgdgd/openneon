@@ -1,0 +1,8 @@
+# reject 原因：uprobe binary 名 'compute_ctl' 不在 enum 内 (合法集合见 schema)
+version: 1
+uprobe:
+  - binary: compute_ctl
+    symbol: "compute_ctl::main::run"
+    module: "compute_ctl::main"
+    type: sync_fn
+    is_async: false
