@@ -36,9 +36,16 @@
 #define LEN_TRACE_ID_HEX	32
 #define LEN_PARENT_ID_HEX	16
 
-/* Decode a single hex digit. Returns -1 on invalid input. */
+/*
+ * Decode a single hex digit. Returns -1 on invalid input.
+ *
+ * Parameter type is 'unsigned char' (not plain 'char') so callers don't
+ * trigger implementation-defined sign-extension when feeding bytes
+ * sourced from a possibly-signed 'char *' buffer. Callers should pass
+ * '(unsigned char) input[i]' explicitly to make the cast visible.
+ */
 static int
-hex_nibble(char c)
+hex_nibble(unsigned char c)
 {
 	if (c >= '0' && c <= '9')
 		return c - '0';
@@ -61,8 +68,8 @@ hex_decode(const char *src, size_t hex_len, uint8_t *dst, size_t dst_len)
 
 	for (size_t i = 0; i < dst_len; i++)
 	{
-		int			hi = hex_nibble(src[2 * i]);
-		int			lo = hex_nibble(src[2 * i + 1]);
+		int			hi = hex_nibble((unsigned char) src[2 * i]);
+		int			lo = hex_nibble((unsigned char) src[2 * i + 1]);
 
 		if (hi < 0 || lo < 0)
 			return false;
@@ -93,8 +100,14 @@ is_all_zero(const uint8_t *buf, size_t len)
 	return true;
 }
 
-bool
-trace_context_parse(const char *input, struct trace_context *out)
+/*
+ * Shared parsing core. Validates the 55-byte wire grammar (length,
+ * NUL terminator, dashes, hex digits, all-zero id rejection) and
+ * decodes the prefix fields. Version-policy decisions live in the
+ * trampoline wrappers below (strict vs lenient).
+ */
+static bool
+parse_common(const char *input, struct trace_context *out)
 {
 	if (input == NULL || out == NULL)
 		return false;
@@ -117,13 +130,9 @@ trace_context_parse(const char *input, struct trace_context *out)
 		input[OFF_DASH3] != '-')
 		return false;
 
-	/* Version must be exactly "00". Spec allows forward-compat, but we
-	 * are a fresh-greenfield emitter and intentionally restrict. */
 	uint8_t		version;
 
 	if (!hex_decode(input + OFF_VERSION, 2, &version, 1))
-		return false;
-	if (version != 0x00)
 		return false;
 
 	uint8_t		trace_id[16];
@@ -152,6 +161,37 @@ trace_context_parse(const char *input, struct trace_context *out)
 	return true;
 }
 
+bool
+trace_context_parse(const char *input, struct trace_context *out)
+{
+	if (!parse_common(input, out))
+		return false;
+
+	/*
+	 * Strict v00: reject anything else. Forward-compat callers should
+	 * use trace_context_parse_lenient() instead (W3C §3.2.2.3).
+	 */
+	if (out->version != 0x00)
+		return false;
+	return true;
+}
+
+bool
+trace_context_parse_lenient(const char *input, struct trace_context *out)
+{
+	if (!parse_common(input, out))
+		return false;
+
+	/*
+	 * W3C §3.2.2.3: "Vendors MUST NOT reject a value due to an
+	 * unrecognized version." Accept any version 0x00..0xfe; only the
+	 * spec-reserved 0xff sentinel is rejected as invalid.
+	 */
+	if (out->version == 0xff)
+		return false;
+	return true;
+}
+
 int
 trace_context_serialize(const struct trace_context *in,
 						char *buf, size_t buflen)
@@ -161,7 +201,16 @@ trace_context_serialize(const struct trace_context *in,
 	if (buflen < TRACE_CONTEXT_BUF_SIZE)
 		return -1;
 
-	/* Version is always emitted as "00" per ADR-0010 / W3C v00. */
+	/*
+	 * We only emit W3C v00 (per ADR-0010). Refuse to serialize a
+	 * trace_context whose version field has been set to anything else;
+	 * otherwise the caller would silently produce a wire value whose
+	 * leading "00" disagrees with its semantic version.
+	 */
+	if (in->version != 0x00)
+		return -1;
+
+	/* Version is always emitted as "00". */
 	buf[OFF_VERSION] = '0';
 	buf[OFF_VERSION + 1] = '0';
 	buf[OFF_DASH1] = '-';

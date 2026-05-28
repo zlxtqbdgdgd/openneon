@@ -126,11 +126,25 @@ test_parse_rejects_bad_hex(void)
 	EXPECT(!trace_context_parse(bad_flags, &tc),
 		   "reject non-hex char in flags");
 
-	/* Wrong delimiter at dash positions. */
+	/* Wrong delimiter at OFF_DASH1 (pos 2). */
 	const char *bad_dash =
 		"00:0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 	EXPECT(!trace_context_parse(bad_dash, &tc),
-		   "reject wrong delimiter");
+		   "reject wrong delimiter at OFF_DASH1 (pos 2)");
+
+	/* Wrong delimiter at OFF_DASH2 (pos 35) — separator between
+	 * trace_id and parent_id is ':' instead of '-'. */
+	const char *bad_dash2 =
+		"00-0af7651916cd43dd8448eb211c80319c:b7ad6b7169203331-01";
+	EXPECT(!trace_context_parse(bad_dash2, &tc),
+		   "reject wrong delimiter at OFF_DASH2 (pos 35)");
+
+	/* Wrong delimiter at OFF_DASH3 (pos 52) — separator between
+	 * parent_id and flags is ':' instead of '-'. */
+	const char *bad_dash3 =
+		"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331:01";
+	EXPECT(!trace_context_parse(bad_dash3, &tc),
+		   "reject wrong delimiter at OFF_DASH3 (pos 52)");
 }
 
 static void
@@ -243,6 +257,115 @@ test_serialize_flags_high_bit(void)
 		   "serialize emits 0xff flags as 'ff'");
 }
 
+/*
+ * Positive case: flags=0x00 (unsampled trace) is the most common
+ * production wire shape. Distinct from the sampled (0x01) case above
+ * and the 0xff bit-pattern case in serialize_flags_high_bit.
+ */
+static void
+test_parse_valid_flags_zero(void)
+{
+	const char *in = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+	struct trace_context tc;
+
+	EXPECT(trace_context_parse(in, &tc), "valid v00 with flags=0x00 parses");
+	EXPECT(tc.trace_flags == 0x00,
+		   "valid v00 flags=0x00 (unsampled) decoded");
+}
+
+/*
+ * W3C §3.2.2.3 forward-compat: lenient parser MUST accept future
+ * versions (0x01..0xfe) and still decode trace_id / parent_id / flags
+ * from the v00-shaped prefix. Strict parser still rejects them.
+ *
+ * "Vendors MUST NOT reject a value due to an unrecognized version."
+ *	  — https://www.w3.org/TR/trace-context/#versioning-of-traceparent
+ */
+static void
+test_parse_lenient_forward_compat(void)
+{
+	struct trace_context tc;
+
+	/* Lenient accepts version 0x01. */
+	const char *v01 =
+		"01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+	EXPECT(trace_context_parse_lenient(v01, &tc),
+		   "lenient accepts v01 (W3C §3.2.2.3 forward-compat)");
+	EXPECT(tc.version == 0x01,
+		   "lenient v01 version field preserved as 0x01");
+	EXPECT(tc.trace_flags == 0x01,
+		   "lenient v01 decodes flags from v00-shaped prefix");
+
+	/* Lenient accepts arbitrary mid-range future versions (0xfe). */
+	const char *vfe =
+		"fe-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+
+	EXPECT(trace_context_parse_lenient(vfe, &tc),
+		   "lenient accepts vfe (max non-reserved future version)");
+
+	/* Lenient still rejects 0xff (spec-reserved as invalid). */
+	const char *vff =
+		"ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+	EXPECT(!trace_context_parse_lenient(vff, &tc),
+		   "lenient still rejects 0xff (spec-reserved invalid)");
+
+	/* Lenient still rejects all-zero trace_id (W3C §3.2.2.2 holds
+	 * regardless of version). */
+	const char *zero_trace_v01 =
+		"01-00000000000000000000000000000000-b7ad6b7169203331-01";
+
+	EXPECT(!trace_context_parse_lenient(zero_trace_v01, &tc),
+		   "lenient still rejects all-zero trace_id at v01");
+
+	/* Strict parser must NOT have been relaxed: it still rejects v01. */
+	EXPECT(!trace_context_parse(v01, &tc),
+		   "strict parser still rejects v01 (no behavior regression)");
+}
+
+/*
+ * Round-trip via the lenient parser using a v00 input: must produce
+ * the exact same wire bytes (strict semantics for v00 unchanged).
+ */
+static void
+test_lenient_v00_roundtrip(void)
+{
+	const char *in = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+	struct trace_context tc;
+
+	EXPECT(trace_context_parse_lenient(in, &tc),
+		   "lenient parses v00 identically to strict");
+
+	char		buf[TRACE_CONTEXT_BUF_SIZE];
+	int			n = trace_context_serialize(&tc, buf, sizeof(buf));
+
+	EXPECT(n == TRACE_CONTEXT_WIRE_LEN && strcmp(buf, in) == 0,
+		   "lenient v00 -> serialize round-trip matches input");
+}
+
+/*
+ * serialize must refuse non-v00 trace_context inputs. Per ADR-0010 we
+ * only emit v00 on the wire; allowing a caller to set in->version != 0
+ * silently would produce a wire value whose leading "00" disagrees with
+ * its semantic version.
+ */
+static void
+test_serialize_rejects_non_v00(void)
+{
+	struct trace_context tc;
+
+	memset(tc.trace_id, 0xab, 16);
+	memset(tc.parent_id, 0xcd, 8);
+	tc.trace_flags = 0;
+	tc.version = 0x01;				/* non-v00; serialize must reject */
+
+	char		buf[TRACE_CONTEXT_BUF_SIZE];
+	int			n = trace_context_serialize(&tc, buf, sizeof(buf));
+
+	EXPECT(n == -1, "serialize rejects in->version != 0 (only emit v00)");
+}
+
 static void
 test_round_trip(void)
 {
@@ -263,16 +386,20 @@ int
 main(void)
 {
 	test_parse_valid_v00();
+	test_parse_valid_flags_zero();
 	test_parse_uppercase_hex_normalized();
 	test_parse_rejects_wrong_length();
 	test_parse_rejects_bad_hex();
 	test_parse_rejects_all_zero_trace_id();
 	test_parse_rejects_all_zero_parent_id();
 	test_parse_rejects_non_v00();
+	test_parse_lenient_forward_compat();
+	test_lenient_v00_roundtrip();
 	test_parse_rejects_null();
 	test_serialize_basic();
 	test_serialize_buffer_too_small();
 	test_serialize_flags_high_bit();
+	test_serialize_rejects_non_v00();
 	test_round_trip();
 
 	printf("\n--- summary: %d passed, %d failed ---\n", g_pass, g_fail);
