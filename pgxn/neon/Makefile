@@ -12,6 +12,7 @@ OBJS = \
 	extension_server.o \
 	file_cache.o \
 	hll.o \
+	jsonlog_ext.o \
 	libpagestore.o \
 	logical_replication_monitor.o \
 	neon.o \
@@ -136,6 +137,16 @@ test/trace_context_test: trace_context.c trace_context.h test/test_trace_context
 .PHONY: check-trace-context
 check-trace-context: test/trace_context_test
 	./test/trace_context_test
+
+# feat-036 · standalone jsonlog_ext unit test · don't depend on PGXS / vendor headers.
+# Anchor pattern (B1 #49 sqlcommenter same): test hook+escape+mask parsing logic
+# with shimmed StringInfo+GUC, vendor jsonlog.c hook landing checked separately.
+.PHONY: check-jsonlog-ext
+check-jsonlog-ext:
+	cc -std=c11 -Wall -Wno-unused-function -DNEON_JSONLOG_STANDALONE_TEST \
+		-I$(srcdir) -o $(srcdir)/test/test_jsonlog_ext \
+		$(srcdir)/test/test_jsonlog_ext.c $(srcdir)/jsonlog_ext.c
+	$(srcdir)/test/test_jsonlog_ext
 
 # ---------------------------------------------------------------------------
 # Standalone unit tests for sqlcommenter.{h,c} (feat-034/#37).

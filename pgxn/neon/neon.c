@@ -42,6 +42,7 @@
 #include "logical_replication_monitor.h"
 #include "unstable_extensions.h"
 #include "walsender_hooks.h"
+#include "jsonlog_ext.h"
 
 /* feat-034: SQLCommenter path α (post_parse_analyze hook) */
 #include "parser/analyze.h"
@@ -731,6 +732,9 @@ _PG_init(void)
 	ExecutorStart_hook = neon_ExecutorStart;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = neon_ExecutorEnd;
+
+	/* feat-036 · PG jsonlog + Neon 字段注入 hook (~30 LOC vendor patch + 280 LOC extension); default mask 全开. */
+	jsonlog_ext_init();
 
 	/* feat-034 path α: install SQLCommenter extractor hook. */
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
