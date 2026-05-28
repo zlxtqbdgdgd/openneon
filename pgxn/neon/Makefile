@@ -135,3 +135,12 @@ check-probes:
 .PHONY: check-feat069
 check-feat069:
 	bash $(srcdir)/probes/tests/feat069_fixtures.sh
+	# R2 元评 (issue#54 comment 4564616746) 补 ·
+	# probes/rust standalone crate 必须本地 cargo check 通过 ·
+	# 防止 #[usdt::provider] 宏漂移 / Cargo.toml profile 配错没 CI 拦
+	@if command -v cargo >/dev/null 2>&1; then \
+		echo "== cargo check probes/rust =="; \
+		cd $(srcdir)/probes/rust && cargo check 2>&1 || exit 1; \
+	else \
+		echo "skip cargo check (no cargo in PATH · CI 装齐 toolchain 后必须跑)"; \
+	fi

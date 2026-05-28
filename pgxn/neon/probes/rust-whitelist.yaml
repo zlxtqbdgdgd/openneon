@@ -224,3 +224,11 @@ denylist:
     - ".*::password::.*"
     - ".*::token::verify.*"
     - ".*::crypto::aead.*"
+    # R2 元评 (issue#54 comment 4564616746) 补缺 ·
+    # 堵 anchor README §deny 优先级 + 安全洞 里点名的三类
+    # "非 ::password:: 命名空间但含敏感字段" 函数 ·
+    # 用精确模式避免误抓现有合法 whitelist 的 proxy::auth::credentials::* sync 函数 ·
+    # 整段 .*::auth::.* deny 留 L4 (需 feat-068 mcp tool 实现 whitelist override 语义)
+    - ".*::authenticate_password.*"
+    - ".*::authenticate_token.*"
+    - ".*::password_hash_verify.*"
