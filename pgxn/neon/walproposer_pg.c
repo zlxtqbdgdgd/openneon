@@ -589,6 +589,12 @@ WalproposerShmemInit(void)
 	if (!found)
 	{
 		memset(walprop_shared, 0, WalproposerShmemSize());
+		/*
+		 * feat-013: "never updated" sentinel is DT_NOBEGIN, not the memset-0
+		 * value (0 == valid PG epoch 2000-01-01 UTC). Seed it on fresh shmem.
+		 */
+		for (int i = 0; i < MAX_SAFEKEEPERS; i++)
+			walprop_shared->safekeeper_lsn_updated_at[i] = DT_NOBEGIN;
 		SpinLockInit(&walprop_shared->mutex);
 		pg_atomic_init_u64(&walprop_shared->propEpochStartLsn, 0);
 		pg_atomic_init_u64(&walprop_shared->mineLastElectedTerm, 0);
@@ -2269,6 +2275,19 @@ walprop_pg_reset_safekeeper_statuses_for_metrics(WalProposer *wp, uint32 num_saf
 	SpinLockAcquire(&shmem->mutex);
 	shmem->num_safekeepers = num_safekeepers;
 	memset(shmem->safekeeper_status, 0, sizeof(shmem->safekeeper_status));
+	/* feat-013: clear stale LSN snapshots on (re)config of the safekeeper set */
+	memset(shmem->safekeeper_commit_lsn, 0, sizeof(shmem->safekeeper_commit_lsn));
+	memset(shmem->safekeeper_flush_lsn, 0, sizeof(shmem->safekeeper_flush_lsn));
+	memset(shmem->safekeeper_remote_consistent_lsn, 0, sizeof(shmem->safekeeper_remote_consistent_lsn));
+	/*
+	 * feat-013: "never updated" sentinel is DT_NOBEGIN (timestamp -infinity),
+	 * NOT 0. TimestampTz == 0 is a valid wall clock (2000-01-01 00:00:00 UTC,
+	 * the PG epoch); a real AppendResponse mirrored at/near that instant would
+	 * otherwise be misread as "never responded". memset cannot write INT64_MIN,
+	 * so initialize each slot explicitly.
+	 */
+	for (int i = 0; i < MAX_SAFEKEEPERS; i++)
+		shmem->safekeeper_lsn_updated_at[i] = DT_NOBEGIN;
 	SpinLockRelease(&shmem->mutex);
 }
 
@@ -2282,6 +2301,27 @@ walprop_pg_update_safekeeper_status_for_metrics(WalProposer *wp, uint32 sk_index
 	SpinLockRelease(&shmem->mutex);
 }
 /* END_HADRON */
+
+/*
+ * feat-013: mirror one safekeeper's latest reported LSNs into shared memory so
+ * the neon_safekeeper_lsn view can serve them from a regular backend.
+ */
+static void
+walprop_pg_update_safekeeper_lsns_for_metrics(WalProposer *wp, uint32 sk_index,
+											  XLogRecPtr commit_lsn,
+											  XLogRecPtr flush_lsn,
+											  XLogRecPtr remote_consistent_lsn)
+{
+	WalproposerShmemState *shmem = wp->api.get_shmem_state(wp);
+
+	Assert(sk_index < MAX_SAFEKEEPERS);
+	SpinLockAcquire(&shmem->mutex);
+	shmem->safekeeper_commit_lsn[sk_index] = commit_lsn;
+	shmem->safekeeper_flush_lsn[sk_index] = flush_lsn;
+	shmem->safekeeper_remote_consistent_lsn[sk_index] = remote_consistent_lsn;
+	shmem->safekeeper_lsn_updated_at[sk_index] = GetCurrentTimestamp();
+	SpinLockRelease(&shmem->mutex);
+}
 
 static const walproposer_api walprop_pg = {
 	.get_shmem_state = walprop_pg_get_shmem_state,
@@ -2317,4 +2357,5 @@ static const walproposer_api walprop_pg = {
 	.log_internal = walprop_pg_log_internal,
 	.reset_safekeeper_statuses_for_metrics = walprop_pg_reset_safekeeper_statuses_for_metrics,
 	.update_safekeeper_status_for_metrics = walprop_pg_update_safekeeper_status_for_metrics,
+	.update_safekeeper_lsns_for_metrics = walprop_pg_update_safekeeper_lsns_for_metrics,
 };

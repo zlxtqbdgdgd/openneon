@@ -17,6 +17,8 @@
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
+#include "utils/pg_lsn.h"
+#include "utils/timestamp.h"
 
 #include "neon.h"
 #include "neon_perf_counters.h"
@@ -31,6 +33,13 @@
  * affected by this flag.
  */
 bool		neon_perf_counters_emit_buckets = true;
+
+/*
+ * feat-013: rollback flag for the neon_safekeeper_lsn view. When off, the
+ * neon_get_safekeeper_lsns() SRF returns no rows (view degrades to empty);
+ * clients fall back to the aggregate lag from pg_stat_replication.
+ */
+bool		neon_safekeeper_lsn_view_enabled = true;
 
 /* BEGIN_HADRON */
 databricks_metrics *databricks_metrics_shared;
@@ -676,6 +685,136 @@ neon_get_perf_counters_histograms(PG_FUNCTION_ARGS)
 	}
 
 	pfree(metrics);
+
+	return (Datum) 0;
+}
+
+/*
+ * feat-013: neon_safekeeper_lsn view backing function.
+ *
+ * Returns one row per safekeeper currently in the walproposer config, exposing
+ * the 4 LSNs the design calls for:
+ *
+ *   safekeeper_id          - the safekeeper's slot index in walproposer
+ *   commit_lsn             - LSN committed by quorum (Paxos safe commit)
+ *   flush_lsn              - LSN this safekeeper fsync'd locally
+ *   backup_lsn             - LSN uploaded to S3   (see note below: always NULL)
+ *   remote_consistent_lsn  - LSN the pageserver applied & persisted
+ *   reachable              - whether this safekeeper is currently active
+ *   last_response_ms       - ms since the last AppendResponse mirrored, or NULL
+ *
+ * Data source: the walproposer process already tracks commit/flush LSN per
+ * safekeeper and the pageserver remote_consistent_lsn piggybacked in each
+ * safekeeper's feedback; feat-013 mirrors those into WalproposerShmemState on
+ * every AppendResponse. We read that shared-memory snapshot here, issuing NO
+ * new query to the safekeeper (real-time, uncached, zero safekeeper-side cost).
+ *
+ * backup_lsn is intentionally always NULL: it is a safekeeper-internal value
+ * exposed only over the safekeeper HTTP /v1/timeline/<ttid>/status API and is
+ * NOT carried in the walproposer append protocol. Reporting NULL (rather than
+ * a fabricated value) is the fail-honest choice; wiring backup_lsn would
+ * require a separate safekeeper query path, which the design explicitly avoids.
+ *
+ * When a safekeeper is not active (reachable=false) its LSN columns are NULL,
+ * so a dead safekeeper yields one honest "all NULL, reachable=false" row while
+ * the others return normally.
+ */
+PG_FUNCTION_INFO_V1(neon_get_safekeeper_lsns);
+Datum
+neon_get_safekeeper_lsns(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	WalproposerShmemState *wp_shmem;
+	uint32		num_safekeepers;
+	uint8		status[MAX_SAFEKEEPERS];
+	XLogRecPtr	commit_lsn[MAX_SAFEKEEPERS];
+	XLogRecPtr	flush_lsn[MAX_SAFEKEEPERS];
+	XLogRecPtr	rc_lsn[MAX_SAFEKEEPERS];
+	TimestampTz	updated_at[MAX_SAFEKEEPERS];
+	TimestampTz	now;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* Rollback path: emit no rows. */
+	if (!neon_safekeeper_lsn_view_enabled)
+		return (Datum) 0;
+
+	wp_shmem = GetWalpropShmemState();
+
+	/*
+	 * Take a consistent snapshot under the existing walproposer mutex, then do
+	 * all the (palloc'ing) tuple work outside the spinlock.
+	 */
+	SpinLockAcquire(&wp_shmem->mutex);
+	num_safekeepers = wp_shmem->num_safekeepers;
+	if (num_safekeepers > MAX_SAFEKEEPERS)
+		num_safekeepers = MAX_SAFEKEEPERS;
+	for (uint32 i = 0; i < num_safekeepers; i++)
+	{
+		status[i] = wp_shmem->safekeeper_status[i];
+		commit_lsn[i] = wp_shmem->safekeeper_commit_lsn[i];
+		flush_lsn[i] = wp_shmem->safekeeper_flush_lsn[i];
+		rc_lsn[i] = wp_shmem->safekeeper_remote_consistent_lsn[i];
+		updated_at[i] = wp_shmem->safekeeper_lsn_updated_at[i];
+	}
+	SpinLockRelease(&wp_shmem->mutex);
+
+	now = GetCurrentTimestamp();
+
+	for (uint32 i = 0; i < num_safekeepers; i++)
+	{
+		Datum		values[7];
+		bool		nulls[7];
+		bool		reachable = (status[i] == 1);
+
+		memset(nulls, false, sizeof(nulls));
+
+		/* safekeeper_id */
+		values[0] = Int32GetDatum((int32) i);
+
+		/* commit_lsn / flush_lsn / remote_consistent_lsn: NULL if unreachable */
+		if (reachable)
+		{
+			values[1] = LSNGetDatum(commit_lsn[i]);
+			values[2] = LSNGetDatum(flush_lsn[i]);
+			/* remote_consistent_lsn may be 0 if no ps feedback seen yet */
+			if (rc_lsn[i] != InvalidXLogRecPtr)
+				values[4] = LSNGetDatum(rc_lsn[i]);
+			else
+				nulls[4] = true;
+		}
+		else
+		{
+			nulls[1] = true;
+			nulls[2] = true;
+			nulls[4] = true;
+		}
+
+		/* backup_lsn: not available via walproposer (fail-honest NULL) */
+		nulls[3] = true;
+
+		/* reachable */
+		values[5] = BoolGetDatum(reachable);
+
+		/*
+		 * last_response_ms: ms since last mirrored AppendResponse, else NULL.
+		 * "never responded" sentinel is DT_NOBEGIN (timestamp -infinity), NOT 0
+		 * -- 0 is the valid PG epoch (2000-01-01 UTC) and a real response near
+		 * that instant must not be misjudged as "never responded".
+		 */
+		if (!TIMESTAMP_IS_NOBEGIN(updated_at[i]))
+		{
+			long		secs;
+			int			usecs;
+
+			TimestampDifference(updated_at[i], now, &secs, &usecs);
+			values[6] = Int64GetDatum((int64) secs * 1000 + usecs / 1000);
+		}
+		else
+			nulls[6] = true;
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
 
 	return (Datum) 0;
 }

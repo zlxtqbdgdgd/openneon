@@ -1835,6 +1835,20 @@ RecvAppendResponses(Safekeeper *sk)
 		}
 
 		HandleSafekeeperResponse(wp, sk);
+
+		/*
+		 * feat-013: mirror this safekeeper's freshly reported LSNs into shared
+		 * memory for the neon_safekeeper_lsn view. remote_consistent_lsn comes
+		 * from the pageserver feedback piggybacked in the append response (only
+		 * meaningful when ps_feedback.present).
+		 */
+		wp->api.update_safekeeper_lsns_for_metrics(
+			wp, sk->index,
+			sk->appendResponse.commitLsn,
+			sk->appendResponse.flushLsn,
+			sk->appendResponse.ps_feedback.present
+				? sk->appendResponse.ps_feedback.remote_consistent_lsn
+				: InvalidXLogRecPtr);
 	}
 
 	if (!readAnything)
