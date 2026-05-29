@@ -319,7 +319,7 @@ jsonlog_ext_init(void)
 		&neon_jsonlog_extra_fields_raw,
 		"endpoint_id,branch_id,project_id,trace_id",
 		PGC_SIGHUP,
-		GUC_LIST_INPUT | GUC_LIST_QUOTE,
+		GUC_LIST_INPUT,
 		neon_jsonlog_extra_fields_check,
 		neon_jsonlog_extra_fields_assign,
 		NULL /* show hook */ );
