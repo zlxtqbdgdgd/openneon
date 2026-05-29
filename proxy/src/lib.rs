@@ -119,6 +119,7 @@ mod serverless;
 mod signals;
 mod stream;
 mod tls;
+mod trace_context;
 mod types;
 mod url;
 mod usage_metrics;
