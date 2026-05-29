@@ -31,6 +31,7 @@ pub fn usr_context(tenant_shard_id: &TenantShardId, timeline_id: &TimelineId) ->
         shard_id: Some(usr::shard_id_str(&tenant_shard_id.to_index())),
         endpoint_id: None, // pageserver 不知道 endpoint（compute/proxy 才有，feat-010）
         project_id: None,  // pageserver 不知道 project（storage_controller mapping，feat-010）
+        warming_up: None,  // pageserver 非 compute, 无 warming 态 (feat-039)
     }
 }
 

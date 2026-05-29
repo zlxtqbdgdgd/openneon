@@ -33,30 +33,31 @@
 // Linux: 用 usdt::provider 宏 真正产 SDT note
 // =====================================================================
 #[cfg(target_os = "linux")]
-mod linux {
+// feat-067/069 (USDT probes) are L3-deferred. The #[usdt::provider] macro
+// generates modules that cannot be re-exported via `pub use linux::{...}`
+// (E0365 on Linux). Until feat-067/069 lands, keep these as no-op stubs so
+// the crate compiles on Linux; restore #[usdt::provider] when implementing.
+pub mod linux {
     /// pageserver hot path · 4 probe (2 函数 × start/done)
-    #[usdt::provider(provider = "neon_pageserver")]
-    pub(crate) mod pageserver {
-        pub(crate) fn get_page_at_lsn__start(tenant_id: &str, timeline_id: &str, lsn: u64) {}
-        pub(crate) fn get_page_at_lsn__done(latency_ns: u64) {}
-        pub(crate) fn layer_download__start(layer_name: &str) {}
-        pub(crate) fn layer_download__done(bytes: u64, latency_ns: u64) {}
+    pub mod pageserver {
+        pub fn get_page_at_lsn__start(tenant_id: &str, timeline_id: &str, lsn: u64) {}
+        pub fn get_page_at_lsn__done(latency_ns: u64) {}
+        pub fn layer_download__start(layer_name: &str) {}
+        pub fn layer_download__done(bytes: u64, latency_ns: u64) {}
     }
 
     /// safekeeper hot path · 2 probe (WAL append start/done)
-    #[usdt::provider(provider = "neon_safekeeper")]
-    pub(crate) mod safekeeper {
-        pub(crate) fn wal_append__start(start_lsn: u64, len: u64) {}
-        pub(crate) fn wal_append__done(end_lsn: u64, latency_ns: u64) {}
+    pub mod safekeeper {
+        pub fn wal_append__start(start_lsn: u64, len: u64) {}
+        pub fn wal_append__done(end_lsn: u64, latency_ns: u64) {}
     }
 
     /// proxy hot path · 4 probe (auth + connection 边界)
-    #[usdt::provider(provider = "neon_proxy")]
-    pub(crate) mod proxy {
-        pub(crate) fn auth__start(endpoint: &str) {}
-        pub(crate) fn auth__done(ok: bool, latency_ns: u64) {}
-        pub(crate) fn connection__established(endpoint: &str, lsn: u64) {}
-        pub(crate) fn connection__closed(duration_ns: u64) {}
+    pub mod proxy {
+        pub fn auth__start(endpoint: &str) {}
+        pub fn auth__done(ok: bool, latency_ns: u64) {}
+        pub fn connection__established(endpoint: &str, lsn: u64) {}
+        pub fn connection__closed(duration_ns: u64) {}
     }
 }
 
