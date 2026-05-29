@@ -51,6 +51,7 @@
 #include "neon.h"
 #include "neon_perf_counters.h"
 #include "neon_walreader.h"
+#include "sqlcommenter.h"
 #include "trace_context.h"
 #include "walproposer.h"
 
@@ -2289,6 +2290,78 @@ GetNeonCurrentClusterSize(void)
 	return pg_atomic_read_u64(&walprop_shared->currentClusterSize);
 }
 uint64		GetNeonCurrentClusterSize(void);
+
+/*
+ * feat-034/#59 path β framework: SQLCommenter 注入 helper for compute-internal
+ * SQL forwarding (logical replication / FDW / dblink).
+ *
+ * 设计 §3.3 path β: 当 compute 内部转发 SQL 给下游 (logical replication 给
+ * standby / postgres_fdw 给远 DB / dblink 跨 DB) · 给原 SQL 末尾追加
+ * `/*traceparent='...',tracestate='neon=walproposer'*/` 注释 · 让下游 DB 解析
+ * SQL 注释提取 trace_id · 跨 SQL 转发的 trace 链路保持连通。
+ *
+ * 单字 tracestate 写法 (design#54 ADR-0015 W3C TraceState §3.3 合规)。
+ *
+ * 实现:
+ *   1. 取当前 backend 的 trace context (PgBackendStatus.trace_context · feat-033/#3
+ *      落地后 · 跟踪 openneon#58); 未注入时 self-generate root marker。
+ *   2. 调 sqlcommenter_inject_traceparent · 返回新 SQL (caller 释放)。
+ *   3. 失败返 NULL · caller 原样发 SQL (degrade gracefully · 不挂)。
+ *
+ * **当前 wire 状态 (out-of-scope · sub follow-up)**:
+ *   - logical replication: walsender 在 walsender.c::WalSndStartReplication 发
+ *     START_REPLICATION SLOT ... LOGICAL 给 standby · 这里 wire 一次
+ *   - postgres_fdw: contrib/postgres_fdw/connection.c::pgfdw_exec_query 调
+ *     libpqsrv_exec · 这里 wire 一次
+ *   - dblink: contrib/dblink/dblink.c::dblink_get_conn → libpq exec · 这里 wire 一次
+ *
+ * 3 类 wire 跨文件 · 跨 contrib · 跟踪 openneon design#16 reopen + 单独 sub-issue
+ * 待开 (本 PR 仅 ship inject 框架 · 调用方 wire 留 sub follow-up)。
+ *
+ * 返 NULL = 不注入 (caller 用原 SQL); 非 NULL = caller 用并 pfree() 释放。
+ */
+char *
+walprop_pg_inject_path_beta_sql(const char *sql)
+{
+	struct trace_context tc;
+	const char *tracestate = "neon=walproposer";
+
+	if (sql == NULL || *sql == '\0')
+		return NULL;
+
+	/*
+	 * Self-generate root: until feat-033/#3 (openneon#58) wires
+	 * MyBEEntry->trace_context · path β 也走 self-generate fallback (跟 walprop_pg
+	 * SK 端 KV 注入 self-generate 同 pattern · 标记 tracestate=neon=walproposer)。
+	 */
+	tc.version = 0x00;
+	if (!pg_strong_random(tc.trace_id, sizeof(tc.trace_id)) ||
+		!pg_strong_random(tc.parent_id, sizeof(tc.parent_id)))
+	{
+		/*
+		 * pg_strong_random 失败 · 不发 path β · caller 原样发 SQL。
+		 * (生产 PG 16+ pg_strong_random 在 Linux 走 getrandom() · 几乎不失败 ·
+		 * fallback degrade gracefully)
+		 */
+		return NULL;
+	}
+	/* Guard against the 1-in-2^128 / 1-in-2^64 all-zero corner. */
+	{
+		size_t		i;
+		bool		all_zero = true;
+
+		for (i = 0; i < sizeof(tc.trace_id); i++)
+			if (tc.trace_id[i] != 0) { all_zero = false; break; }
+		if (all_zero) tc.trace_id[0] = 0x01;
+		all_zero = true;
+		for (i = 0; i < sizeof(tc.parent_id); i++)
+			if (tc.parent_id[i] != 0) { all_zero = false; break; }
+		if (all_zero) tc.parent_id[0] = 0x01;
+	}
+	tc.trace_flags = TRACE_CONTEXT_FLAG_SAMPLED | TRACE_CONTEXT_FLAG_RANDOM;
+
+	return sqlcommenter_inject_traceparent(sql, &tc, tracestate);
+}
 
 /* BEGIN_HADRON */
 static void
