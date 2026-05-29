@@ -52,6 +52,10 @@ members = [
     "pgxn/neon/communicator",
 ]
 
+# feat-069/#34 · USDT provider crate 是 standalone (零 dep 让 cargo check 隔离)
+# · 不进 workspace · root cargo invocation 须排除以免 multiple-workspace-roots 冲突
+exclude = ["pgxn/neon/probes/rust"]
+
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
