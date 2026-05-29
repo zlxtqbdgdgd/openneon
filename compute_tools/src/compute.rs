@@ -1047,6 +1047,22 @@ impl ComputeNode {
         };
         self.set_status(ComputeStatus::Running);
 
+        // feat-039/#57: 挂 warming_up 状态机生命周期到 Running 切换点 (ADR-0013 设计意图)。
+        //
+        // 状态机启动后 1Hz tick:
+        //   - LFC ratio ≥ target  AND  elapsed ≥ min  → 退 (T1 fast-path)
+        //   - elapsed ≥ max                            → 退 (T2 forced)
+        //   - config 变化                              → 退 (T3 OQ4 process-local: 走 init 不变)
+        //   - 已退出 (Done sticky)                     → no-op
+        //
+        // 注: prod_lfc_provider 当前返 NullLfcProvider · 生产路径走 T2 max_seconds 兜底。
+        // T1 fast-path 在 feat-068 communicator socket RPC 拉 LFC ratio wire 完成后才工作
+        // (跟踪 openneon#56)。
+        crate::warming_up::init_global_controller(
+            crate::warming_up::WarmingUpConfig::default(),
+            crate::warming_up::prod_lfc_provider(),
+        );
+
         // Log metrics so that we can search for slow operations in logs
         info!(?metrics, postmaster_pid = %postmaster_pid, "compute start finished");
 
