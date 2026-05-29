@@ -19,6 +19,13 @@
 #include "lib/stringinfo.h"
 #include "storage/block.h"
 #include "storage/buf_internals.h"
+#include "trace_context.h"		/* feat-033: W3C TraceContext (traceparent) */
+
+/* Pagestore wire protocol version this build understands. feat-033 bumped 3->4 for W3C
+ * TraceContext propagation. Runtime negotiation/downgrade in libpagestore.c; matching Rust
+ * parser in libs/pageserver_api/src/pagestream_api.rs. Keep in sync with PagestreamProtocolVersion. */
+#define NEON_PROTOCOL_VERSION_LATEST 4
+#define NEON_PROTOCOL_VERSION_MIN 2
 
 #define MAX_SHARDS 128
 #define MAX_PAGESERVER_CONNSTRING_SIZE 256
@@ -54,6 +61,10 @@ typedef struct
 	NeonRequestId reqid;
 	XLogRecPtr	lsn;
 	XLogRecPtr	not_modified_since;
+	/* feat-033 (#21/#22): optional W3C TraceContext propagated to pageserver. Only serialized
+	 * on V4 wire (neon_protocol_version >= 4); on V3/V2 ignored. Filled by caller. */
+	bool		has_trace_context;
+	struct trace_context trace_context;
 } NeonMessage;
 
 #define messageTag(m) (((const NeonMessage *)(m))->tag)
@@ -173,7 +184,7 @@ typedef struct
 } NeonGetSlruSegmentResponse;
 
 
-extern StringInfoData nm_pack_request(NeonRequest *msg);
+extern StringInfoData nm_pack_request(NeonRequest *msg, int protocol_version);
 extern NeonResponse *nm_unpack_response(StringInfo s);
 extern char *nm_to_string(NeonMessage *msg);
 

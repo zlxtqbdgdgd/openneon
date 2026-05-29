@@ -409,9 +409,20 @@ impl Level {
     }
 }
 
+// STUBBED-L2b(feat-013): no-op until per-safekeeper LSN metric mirroring 重新 compile-gated 落地
+extern "C" fn update_safekeeper_lsns_for_metrics(
+    _wp: *mut WalProposer,
+    _sk_index: uint32,
+    _commit_lsn: XLogRecPtr,
+    _flush_lsn: XLogRecPtr,
+    _remote_consistent_lsn: XLogRecPtr,
+) {
+}
+
 pub(crate) fn create_api() -> walproposer_api {
     walproposer_api {
         get_shmem_state: Some(get_shmem_state),
+        update_safekeeper_lsns_for_metrics: Some(update_safekeeper_lsns_for_metrics),
         start_streaming: Some(start_streaming),
         get_flush_rec_ptr: Some(get_flush_rec_ptr),
         update_donor: Some(update_donor),
@@ -489,6 +500,12 @@ pub fn empty_shmem() -> crate::bindings::WalproposerShmemState {
         wal_rate_limiter: empty_wal_rate_limiter,
         num_safekeepers: 0,
         safekeeper_status: [0; 32],
+        safekeeper_commit_lsn: [0; 32],
+        safekeeper_flush_lsn: [0; 32],
+        safekeeper_remote_consistent_lsn: [0; 32],
+        safekeeper_lsn_updated_at: [0; 32],
+        wal_write_bytes_total: crate::bindings::pg_atomic_uint64 { value: 0 },
+        wal_send_to_safekeeper_bytes_total: crate::bindings::pg_atomic_uint64 { value: 0 },
     }
 }
 

@@ -1094,7 +1094,7 @@ neon_post_parse_analyze(ParseState *pstate, Query *query)
 	/* Chain to upstream hook (if any) first; never swallow its effects. */
 	if (prev_post_parse_analyze_hook != NULL)
 	{
-#if PG_MAJORVERSION_NUM >= 16
+#if PG_MAJORVERSION_NUM >= 14
 		prev_post_parse_analyze_hook(pstate, query, jstate);
 #else
 		prev_post_parse_analyze_hook(pstate, query);
