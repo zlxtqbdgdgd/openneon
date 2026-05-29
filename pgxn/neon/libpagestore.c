@@ -39,6 +39,7 @@
 #include "neon_perf_counters.h"
 #include "neon_utils.h"
 #include "pagestore_client.h"
+#include "neon_trace_status.h"
 #include "walproposer.h"
 
 #ifdef __linux__
@@ -1258,6 +1259,16 @@ pageserver_send(shardno_t shard_no, NeonRequest *request)
 	}
 
 	request->reqid = GENERATE_REQUEST_ID();
+
+	/*
+	 * feat-033: 把当前 backend 的 client query trace (post_parse_analyze_hook 经
+	 * SQLCommenter path α 存入 neon_trace_status) 附到 pagestream 请求 header, 让
+	 * getpage 等请求携带 client trace_id 透传到 pageserver (per-request · v4 wire)。
+	 * 无 client traceparent 时 has_trace_context 保持 false (v3 兼容)。nm_pack_request
+	 * 仅在 negotiated version >= 4 时序列化, 故无条件填充无害。
+	 */
+	if (!request->has_trace_context)
+		request->has_trace_context = neon_trace_status_get_my(&request->trace_context);
 	/*
 	 * Pack with the wire version this shard actually negotiated (issue #22 negotiation
 	 * downgrade). If we somehow get here before pageserver_connect populated it (which

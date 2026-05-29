@@ -20,6 +20,14 @@
 
 #include "neon_trace_status.h"
 
+/*
+ * feat-033: backend-local 快缓存 THIS backend 的当前 query trace (镜像 shmem slot)。
+ * getpage hot path (libpagestore.c) 经 neon_trace_status_get_my() O(1) 读自己的
+ * trace, 免每请求扫 shmem / 取锁。_set 时镜像 · _clear 时失效 (语义同 shmem slot)。
+ */
+static struct trace_context my_trace_cache;
+static bool my_trace_cache_valid = false;
+
 /* ------------------------------------------------------------------ */
 /* Shared state                                                       */
 /* ------------------------------------------------------------------ */
@@ -143,6 +151,10 @@ neon_trace_status_set(const struct trace_context *tc, const char *tracestate)
 	if (tc == NULL)
 		return;
 
+	/* feat-033: 镜像到 backend-local 快缓存 (getpage 路径 O(1) 读) */
+	my_trace_cache = *tc;
+	my_trace_cache_valid = true;
+
 	int			idx = locate_or_claim_my_slot();
 
 	if (idx < 0)
@@ -172,6 +184,9 @@ neon_trace_status_set(const struct trace_context *tc, const char *tracestate)
 void
 neon_trace_status_clear(void)
 {
+	/* feat-033: 失效 backend-local 快缓存 */
+	my_trace_cache_valid = false;
+
 	if (trace_ctl == NULL)
 		return;
 
@@ -226,6 +241,20 @@ neon_trace_status_current(struct trace_context *out,
 	}
 	LWLockRelease(lock);
 	return hit;
+}
+
+/*
+ * feat-033: O(1) 读 THIS backend 当前 query trace (backend-local 缓存 · 无 shmem
+ * 扫描/锁)。getpage hot path 用之把 client query trace 附到 pagestream 请求。
+ * 命中(当前 query 有 trace)返 true + 填 *out; 否则 false。
+ */
+bool
+neon_trace_status_get_my(struct trace_context *out)
+{
+	if (!my_trace_cache_valid || out == NULL)
+		return false;
+	*out = my_trace_cache;
+	return true;
 }
 
 bool
