@@ -74,6 +74,7 @@ pub fn init_tracing_and_logging(
     // pageserver / safekeeper / proxy 共享进程不走这条 (各自 resolver 不填,
     // UsrContext.warming_up 保持 None → 不贴 label,OQ4)。
     let usr_layer = tracing_utils::usr::usr_layer(|| tracing_utils::usr::UsrContext {
+        warming_up: Some(crate::warming_up::is_warming_up()),
         ..Default::default()
     });
 

@@ -32,6 +32,20 @@ pub const ATTR_TIMELINE_ID: &str = "openneon.usr.timeline_id";
 pub const ATTR_SHARD_ID: &str = "openneon.usr.shard_id";
 pub const ATTR_ENDPOINT_ID: &str = "openneon.usr.endpoint_id";
 pub const ATTR_PROJECT_ID: &str = "openneon.usr.project_id";
+pub const ATTR_WARMING_UP: &str = "openneon.usr.warming_up";
+
+/// USR_LABEL_NAMES 常量列表 (feat-039/#2 USR pattern · 第 8 维加 warming_up)。
+///
+/// 跟 Prometheus + OTel + tracing 三 channel 同步: 各 channel exporter 从这里拿 label
+/// name 列表, 一处改全链路飘起。
+pub const USR_LABEL_NAMES: &[&str] = &[
+    ATTR_TENANT_ID,
+    ATTR_TIMELINE_ID,
+    ATTR_SHARD_ID,
+    ATTR_ENDPOINT_ID,
+    ATTR_PROJECT_ID,
+    ATTR_WARMING_UP,
+];
 
 /// 一份已 string 化的 USR 上下文快照（resolver 输出）。
 ///
@@ -44,12 +58,15 @@ pub struct UsrContext {
     pub shard_id: Option<String>,
     pub endpoint_id: Option<String>,
     pub project_id: Option<String>,
+    /// feat-039: warming_up 第 8 维 label (compute warming 状态机 #67 · 由 logger.rs
+    /// resolver 填 Some(is_warming_up()); 共享进程 resolver 不填 → None 不贴 label)。
+    pub warming_up: Option<bool>,
 }
 
 impl UsrContext {
     /// 把上下文转成 OTel `KeyValue` 列表，仅含非空字段。
     pub fn as_key_values(&self) -> Vec<KeyValue> {
-        let mut out = Vec::with_capacity(5);
+        let mut out = Vec::with_capacity(6);
         if let Some(v) = &self.tenant_id {
             out.push(KeyValue::new(ATTR_TENANT_ID, v.clone()));
         }
@@ -65,6 +82,9 @@ impl UsrContext {
         if let Some(v) = &self.project_id {
             out.push(KeyValue::new(ATTR_PROJECT_ID, v.clone()));
         }
+        if let Some(v) = &self.warming_up {
+            out.push(KeyValue::new(ATTR_WARMING_UP, *v));
+        }
         out
     }
 
@@ -74,6 +94,7 @@ impl UsrContext {
             && self.shard_id.is_none()
             && self.endpoint_id.is_none()
             && self.project_id.is_none()
+            && self.warming_up.is_none()
     }
 }
 
