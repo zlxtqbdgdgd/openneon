@@ -2364,6 +2364,8 @@ pub(crate) static LIVE_CONNECTIONS: Lazy<IntCounterPairVec> = Lazy::new(|| {
 pub(crate) enum ComputeCommandKind {
     PageStreamV3,
     PageStreamV2,
+    // feat-033: V4 adds W3C TraceContext propagation per pagestream message.
+    PageStreamV4,
     Basebackup,
     Fullbackup,
     LeaseLsn,
