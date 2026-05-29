@@ -30,6 +30,9 @@ use crate::{control_file, wal_storage};
 
 pub const SK_PROTO_VERSION_2: u32 = 2;
 pub const SK_PROTO_VERSION_3: u32 = 3;
+/// feat-035: v4 reuses v3 wire layout; only adds W3C traceparent KV in the
+/// START_WAL_PUSH command (parsed by handler.rs). Binary messages are v3-identical.
+pub const SK_PROTO_VERSION_4: u32 = 4;
 pub const UNKNOWN_SERVER_VERSION: PgVersionId = PgVersionId::UNKNOWN;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -485,7 +488,7 @@ impl ProposerAcceptorMessage {
 
     /// Parse proposer message.
     pub fn parse(mut msg_bytes: Bytes, proto_version: u32) -> Result<ProposerAcceptorMessage> {
-        if proto_version == SK_PROTO_VERSION_3 {
+        if proto_version == SK_PROTO_VERSION_3 || proto_version == SK_PROTO_VERSION_4 {
             if msg_bytes.is_empty() {
                 bail!("ProposerAcceptorMessage is not complete: missing tag");
             }
@@ -778,7 +781,7 @@ impl AcceptorProposerMessage {
 
     /// Serialize acceptor -> proposer message.
     pub fn serialize(&self, buf: &mut BytesMut, proto_version: u32) -> Result<()> {
-        if proto_version == SK_PROTO_VERSION_3 {
+        if proto_version == SK_PROTO_VERSION_3 || proto_version == SK_PROTO_VERSION_4 {
             match self {
                 AcceptorProposerMessage::Greeting(msg) => {
                     buf.put_u8(b'g');

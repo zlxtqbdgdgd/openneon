@@ -186,7 +186,8 @@ WalProposerCreate(WalProposerConfig *config, walproposer_api api)
 	}
 	wp->quorum = wp->n_safekeepers / 2 + 1;
 
-	if (wp->config->proto_version != 2 && wp->config->proto_version != 3)
+	if (wp->config->proto_version != 2 && wp->config->proto_version != 3
+		&& wp->config->proto_version != 4)
 		wp_log(FATAL, "unsupported safekeeper protocol version %d", wp->config->proto_version);
 	if (wp->safekeepers_generation > INVALID_GENERATION && wp->config->proto_version < 3)
 		wp_log(FATAL, "enabling generations requires protocol version 3");
@@ -2281,12 +2282,12 @@ MembershipConfigurationSerialize(MembershipConfiguration *mconf, StringInfo buf)
 static void
 PAMessageSerialize(WalProposer *wp, ProposerAcceptorMessage *msg, StringInfo buf, int proto_version)
 {
-	/* both version are supported currently until we fully migrate to 3 */
-	Assert(proto_version == 3 || proto_version == 2);
+	/* feat-035: v4 reuses v3 wire layout; only adds traceparent KV in START_WAL_PUSH handshake. */
+	Assert(proto_version == 4 || proto_version == 3 || proto_version == 2);
 
 	resetStringInfo(buf);
 
-	if (proto_version == 3)
+	if (proto_version == 3 || proto_version == 4)
 	{
 		/*
 		 * v2 sends structs for some messages as is, so commonly send tag only
@@ -2547,7 +2548,7 @@ AsyncReadMessage(Safekeeper *sk, AcceptorProposerMessage *anymsg)
 	s.maxlen = buf_size;
 	s.cursor = 0;
 
-	if (wp->config->proto_version == 3)
+	if (wp->config->proto_version == 3 || wp->config->proto_version == 4)
 	{
 		tag = pq_getmsgbyte(&s);
 		if (tag != anymsg->tag)

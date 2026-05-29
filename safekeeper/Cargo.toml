@@ -12,6 +12,7 @@ testing = ["fail/failpoints"]
 benchmarking = []
 
 [dependencies]
+tracing-utils.workspace = true
 arc-swap.workspace = true
 async-stream.workspace = true
 anyhow.workspace = true
