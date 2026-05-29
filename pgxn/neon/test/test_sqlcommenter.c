@@ -90,7 +90,7 @@ test_multi_kv(void)
 {
 	const char *sql =
 	"UPDATE users SET name = 'foo' WHERE id = 7 "
-	"/*action='checkout',traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',tracestate='neon%3Droot%3Dproxy'*/";
+	"/*action='checkout',traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',tracestate='neon%3Dproxy'*/";
 	struct trace_context tc;
 	char	   *ts = NULL;
 
@@ -276,7 +276,7 @@ test_inject_with_tracestate(void)
 	 * parent_id; RFC 3986 allows either case but recommends uppercase,
 	 * and our decoder accepts both — we pick lowercase for symmetry).
 	 */
-	EXPECT(strstr(injected, "tracestate='neon%3droot%3dproxy'") != NULL,
+	EXPECT(strstr(injected, "tracestate='neon%3dproxy'") != NULL,
 		   "inject: tracestate URL-encoded into single-quoted value");
 
 	/* Round-trip via extractor. */
