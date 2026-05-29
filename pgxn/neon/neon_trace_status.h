@@ -72,6 +72,8 @@ extern void neon_trace_status_clear(void);
  * *tracestate_out_buf (NULL-tolerated) are filled. `tracestate_buf_len`
  * is the caller's buffer size for the tracestate copy.
  */
+extern bool neon_trace_status_get_my(struct trace_context *out);
+
 extern bool neon_trace_status_get_by_pid(int pid,
 										 struct trace_context *out,
 										 char *tracestate_out_buf,

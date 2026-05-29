@@ -2430,10 +2430,13 @@ walprop_pg_update_safekeeper_lsns_for_metrics(WalProposer *wp, uint32 sk_index,
  *   `neon=walproposer` 标记 (W3C TraceState §3.3 single-token form, design#54 ADR),
  *   让下游 (SK / pageserver) 知道这一链路根来自 compute walproposer 自己。
  *
- * 当 feat-033/#3 merge 进 main 后 (跟踪 openneon#58), 应该把这里改成:
- *   if (MyBEEntry != NULL && trace_context_is_valid(&MyBEEntry->trace_context))
- *       return trace_context_serialize(&MyBEEntry->trace_context, buf, buflen);
- * 即"有上游就承接, 没上游就 fallback 自生 root"——TODO(feat-033/#3 wiring)。
+ * 设计决定 (openneon#58 · 选项 A): START_WAL_PUSH 是**每连接握手一次**的连接级命令
+ * (非每条 WAL record), 且 walproposer 是独立后台进程 (非跑 client query 的 backend),
+ * 一次 WAL push 批量多 backend 的提交。故这里 traceparent **本质是连接级** ——
+ * self-generate root (tracestate=neon=walproposer) 即正确模型, 非 TODO。真正的
+ * per-request trace 精度在另两层承载: getpage (feat-033 · libpagestore send 时
+ * neon_trace_status_get_my 接 client query trace · 已落地) + SQLCommenter path β
+ * (feat-034 · 转发 SQL 注入)。openneon#58 据此 close。
  *
  * 返回 1 成功 (buf 已填 55-byte traceparent), 0 跳过 (不发 KV)。
  */
