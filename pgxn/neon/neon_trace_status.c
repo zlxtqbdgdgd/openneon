@@ -16,6 +16,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/proc.h"
 
 #include "neon_trace_status.h"
 
