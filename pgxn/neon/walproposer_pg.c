@@ -2297,7 +2297,7 @@ uint64		GetNeonCurrentClusterSize(void);
  *
  * 设计 §3.3 path β: 当 compute 内部转发 SQL 给下游 (logical replication 给
  * standby / postgres_fdw 给远 DB / dblink 跨 DB) · 给原 SQL 末尾追加
- * `/*traceparent='...',tracestate='neon=walproposer'*/` 注释 · 让下游 DB 解析
+ * 形如 traceparent='...',tracestate='neon=walproposer' 的 SQL 块注释（注释语法包裹） · 让下游 DB 解析
  * SQL 注释提取 trace_id · 跨 SQL 转发的 trace 链路保持连通。
  *
  * 单字 tracestate 写法 (design#54 ADR-0015 W3C TraceState §3.3 合规)。

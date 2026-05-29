@@ -33,30 +33,30 @@
 // Linux: 用 usdt::provider 宏 真正产 SDT note
 // =====================================================================
 #[cfg(target_os = "linux")]
-mod linux {
+pub mod linux {
     /// pageserver hot path · 4 probe (2 函数 × start/done)
-    #[usdt::provider(provider = "neon_pageserver")]
-    pub(crate) mod pageserver {
-        pub(crate) fn get_page_at_lsn__start(tenant_id: &str, timeline_id: &str, lsn: u64) {}
-        pub(crate) fn get_page_at_lsn__done(latency_ns: u64) {}
-        pub(crate) fn layer_download__start(layer_name: &str) {}
-        pub(crate) fn layer_download__done(bytes: u64, latency_ns: u64) {}
+    // STUBBED-L3(feat-067/069) #[usdt::provider(provider = "neon_pageserver")]
+    pub mod pageserver {
+        pub fn get_page_at_lsn__start(tenant_id: &str, timeline_id: &str, lsn: u64) {}
+        pub fn get_page_at_lsn__done(latency_ns: u64) {}
+        pub fn layer_download__start(layer_name: &str) {}
+        pub fn layer_download__done(bytes: u64, latency_ns: u64) {}
     }
 
     /// safekeeper hot path · 2 probe (WAL append start/done)
-    #[usdt::provider(provider = "neon_safekeeper")]
-    pub(crate) mod safekeeper {
-        pub(crate) fn wal_append__start(start_lsn: u64, len: u64) {}
-        pub(crate) fn wal_append__done(end_lsn: u64, latency_ns: u64) {}
+    // STUBBED-L3(feat-067/069) #[usdt::provider(provider = "neon_safekeeper")]
+    pub mod safekeeper {
+        pub fn wal_append__start(start_lsn: u64, len: u64) {}
+        pub fn wal_append__done(end_lsn: u64, latency_ns: u64) {}
     }
 
     /// proxy hot path · 4 probe (auth + connection 边界)
-    #[usdt::provider(provider = "neon_proxy")]
-    pub(crate) mod proxy {
-        pub(crate) fn auth__start(endpoint: &str) {}
-        pub(crate) fn auth__done(ok: bool, latency_ns: u64) {}
-        pub(crate) fn connection__established(endpoint: &str, lsn: u64) {}
-        pub(crate) fn connection__closed(duration_ns: u64) {}
+    // STUBBED-L3(feat-067/069) #[usdt::provider(provider = "neon_proxy")]
+    pub mod proxy {
+        pub fn auth__start(endpoint: &str) {}
+        pub fn auth__done(ok: bool, latency_ns: u64) {}
+        pub fn connection__established(endpoint: &str, lsn: u64) {}
+        pub fn connection__closed(duration_ns: u64) {}
     }
 }
 
@@ -107,7 +107,7 @@ pub mod proxy {
 //   2. 任何往 provider 模块里加 async fn 的尝试都会被 compiler 直接拒绝
 //      (provider 宏只允许 fn · 不允许 async fn · usdt crate 的宏展开决定)
 //
-// 编译期失败示例 (反例): 在 #[usdt::provider] 模块里写 `async fn foo() {}` ·
+// 编译期失败示例 (反例): 在 // STUBBED-L3(feat-067/069) #[usdt::provider] 模块里写 `async fn foo() {}` ·
 //   usdt::provider 宏会报 `expected fn · found async fn` · 编译直接失败 ·
 //   不需要额外人为 assert。
 const _PROBE_BARRIER_PROVIDER_NAMES_OK: () = {
