@@ -107,4 +107,18 @@ extern char *sqlcommenter_inject_traceparent(const char *sql,
 											 const struct trace_context *tc,
 											 const char *tracestate);
 
+/*
+ * feat-034 path β framework (openneon#59): wrapper for compute-internal SQL
+ * forwarding (logical replication / FDW / dblink). Generates a self-generated
+ * root trace context, appends a SQLCommenter `traceparent='...',tracestate='neon=walproposer'`
+ * comment, and returns the augmented SQL. Caller must pfree() the result.
+ *
+ * Returns NULL when injection is skipped (NULL sql / RNG failure / sqlcommenter
+ * internal error), in which case caller should send the original SQL unchanged.
+ *
+ * Wire-up at logical-replication / postgres_fdw / dblink call sites is tracked
+ * as sub follow-ups under design#16.
+ */
+extern char *walprop_pg_inject_path_beta_sql(const char *sql);
+
 #endif							/* SQLCOMMENTER_H */
