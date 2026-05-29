@@ -33,7 +33,7 @@ pub const USR_TAGGING_ENABLED_ENV: &str = "USR_TAGGING_ENABLED";
 /// 紧急 unblock 已部署用户 dashboard。
 pub const USR_NAMING_LEGACY_ENV: &str = "OPENNEON_USR_NAMING_LEGACY";
 
-/// USR OTel attribute 的统一 namespace 前缀。**禁止**写 `tenant-id` / `tenantId` 等漂移形式。
+/// USR OTel attribute 的统一 namespace 前缀。**禁止**写 `tenant-id` / `tenantId` 等漂移形式。 USR-LINT-IGNORE: 本行 tenantId 为禁用名的文档举例本身
 pub const USR_NAMESPACE: &str = "openneon.usr.";
 
 /// USR attribute / log record field 的 canonical key 名（OTel dot 分隔）。
