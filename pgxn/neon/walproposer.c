@@ -676,26 +676,60 @@ SendStartWALPush(Safekeeper *sk)
 
 	/* Forbid implicit timeline creation if generations are enabled. */
 	char	   *allow_timeline_creation = WalProposerGenerationsEnabled(wp) ? "false" : "true";
-#define CMD_LEN 512
+#define CMD_LEN 1024
 	char		cmd[CMD_LEN];
 
+	/*
+	 * feat-035 段 1 (compute → SK): proto_version >= 4 时附加 W3C traceparent KV.
+	 * 来源由 walproposer_api::get_outbound_traceparent 提供（Postgres-side 走
+	 * PgBackendStatus.trace_context, feat-033/#3; 未注入时自生 root + 配套
+	 * tracestate=neon=walproposer · 单字写法 W3C TraceState §3.3 合规, design#54 ADR).
+	 *
+	 * SK 端 §4.5 兼容矩阵: v3 SK 收到 v4 命令含 traceparent → silent ignore
+	 * unknown KV (handler.rs parse_cmd 已统一 forward-compat).
+	 */
+	char		tp_buf[64];				/* TRACE_CONTEXT_BUF_SIZE = 56, 上取整 */
+	char		ts_buf[256];			/* tracestate sibling, ASCII */
+	size_t		ts_len = 0;
+	bool		emit_traceparent = false;
+	int			ret;
 
-	snprintf(cmd, CMD_LEN, "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s')", wp->config->proto_version, allow_timeline_creation);
+	if (wp->config->proto_version >= 4 && wp->api.get_outbound_traceparent != NULL)
+	{
+		ret = wp->api.get_outbound_traceparent(wp,
+											   tp_buf, sizeof(tp_buf),
+											   ts_buf, sizeof(ts_buf),
+											   &ts_len);
+		if (ret == 1)
+			emit_traceparent = true;
+	}
+
+	if (emit_traceparent && ts_len > 0)
+	{
+		snprintf(cmd, CMD_LEN,
+				 "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s', traceparent '%s', tracestate '%.*s')",
+				 wp->config->proto_version, allow_timeline_creation,
+				 tp_buf, (int) ts_len, ts_buf);
+	}
+	else if (emit_traceparent)
+	{
+		snprintf(cmd, CMD_LEN,
+				 "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s', traceparent '%s')",
+				 wp->config->proto_version, allow_timeline_creation, tp_buf);
+	}
+	else
+	{
+		snprintf(cmd, CMD_LEN,
+				 "START_WAL_PUSH (proto_version '%d', allow_timeline_creation '%s')",
+				 wp->config->proto_version, allow_timeline_creation);
+	}
 	if (!wp->api.conn_send_query(sk, cmd))
 	{
 		wp_log(WARNING, "failed to send '%s' query to safekeeper %s:%s: %s",
-			   cmd_to_send, sk->host, sk->port, wp->api.conn_error_message(sk));
-#ifndef WALPROPOSER_LIB
-		if (cmd_with_trace != NULL)
-			free(cmd_with_trace);
-#endif
+			   cmd, sk->host, sk->port, wp->api.conn_error_message(sk));
 		ShutdownConnection(sk);
 		return;
 	}
-#ifndef WALPROPOSER_LIB
-	if (cmd_with_trace != NULL)
-		free(cmd_with_trace);
-#endif
 	sk->state = SS_WAIT_EXEC_RESULT;
 	wp->api.update_event_set(sk, WL_SOCKET_READABLE);
 }
