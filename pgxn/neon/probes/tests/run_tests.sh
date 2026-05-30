@@ -32,6 +32,12 @@ run_case "whitelist.example.yaml" \
 run_case "denylist.example.yaml" \
     python3 "$VALIDATE" "$PROBES_DIR/denylist.example.yaml"
 
+# feat-067: 校验操作性文件 (非 .example demo · 真正供 feat-068 mcp tool 加载的)
+run_case "whitelist.yaml (operative)" \
+    python3 "$VALIDATE" "$PROBES_DIR/whitelist.yaml"
+run_case "denylist.yaml (operative · feat-067)" \
+    python3 "$VALIDATE" "$PROBES_DIR/denylist.yaml"
+
 echo
 echo "== 非法 fixture (应被拒) =="
 for f in "$HERE"/invalid/*.yaml; do
