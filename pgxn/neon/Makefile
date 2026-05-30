@@ -58,6 +58,8 @@ DATA = \
 	neon--1.6--1.7.sql \
 	neon--1.7--1.8.sql \
 	neon--1.8--1.9.sql \
+	neon--1.9--1.10.sql \
+	neon--1.10--1.9.sql \
 	neon--1.9--1.8.sql \
 	neon--1.8--1.7.sql \
 	neon--1.7--1.6.sql \
