@@ -1,0 +1,29 @@
+# feat-067 · 独立 denylist (hard-deny · 设计 §3.1/§3.5 要求的两文件之一 · 跟 feat-069 rust-denylist.yaml 共享 schema)
+#
+# 语义: feat-068 mcp tool 必须 hard-coded 加载本文件 · 任一 pattern 命中即 reject ·
+#       denylist 优先级 > whitelist (不可绕过 · 即便 whitelist 命中也拒)。
+# 两文件分离 (vs whitelist.yaml 内嵌 denylist) 理由 (设计 §3.5):
+#   - 安全语义清晰: hard-deny 单独文件便于 audit / sign / read-only mount
+#   - 审计颗粒: denylist 变更频率极低 (敏感函数稳定) · 跟 whitelist 分开管 review
+# 一致性: usdt_probe_patterns 与 whitelist.yaml 内嵌 denylist 段一致 (同 7 类 PG 侧) ·
+#         uprobe_symbol_patterns 与 rust-denylist.yaml 一致 (同 6 类 Rust 侧)。
+version: 1
+
+denylist:
+  # PG USDT probe deny (issue#31 验收门 7 类 · feat-068 re.fullmatch 按 probe 名匹配)
+  usdt_probe_patterns:
+    - "^pg_md5_hash.*"        # 1. MD5 hash
+    - "^scram_.*"             # 2. SCRAM auth
+    - "^be_tls_.*"            # 3. TLS handshake
+    - "^be_gssapi_.*"         # 4. GSSAPI auth
+    - "^get_role_password$"   # 5. role password 读取
+    - "^verify_token$"        # 6. token 校验
+    - "^check_password_hash$" # 7. password hash 校验
+  # Rust uprobe symbol deny (跟 feat-069 rust-denylist.yaml 同 6 类 crypto pattern)
+  uprobe_symbol_patterns:
+    - ".*::scram_.*"
+    - ".*::sasl::.*"
+    - ".*::tls::handshake.*"
+    - ".*::password::.*"
+    - ".*::token::verify.*"
+    - ".*::crypto::aead.*"
